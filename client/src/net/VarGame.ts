@@ -153,8 +153,10 @@ export class VarGame implements VarSession {
   };
 
   private onHello = (payload: { from: string }): void => {
-    if (this.role === 'host') this.createPeer(true);
-    void payload;
+    if (this.role === 'host') {
+      this.remotePeerId = payload.from;
+      this.createPeer(true);
+    }
   };
 
   private onPeerLeft = (): void => {
