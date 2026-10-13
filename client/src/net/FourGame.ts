@@ -29,7 +29,10 @@ interface NetResign {
 interface NetRematch {
   t: 'rematch';
 }
-type FourNetMsg = NetStart | NetMove | NetResign | NetRematch;
+interface NetAbort {
+  t: 'abort';
+}
+type FourNetMsg = NetStart | NetMove | NetResign | NetRematch | NetAbort;
 
 export interface FourGameOptions {
   socket: Socket;
@@ -288,6 +291,9 @@ export class FourGame implements FourSession {
       case 'resign':
         if (!this.engine.result) this.engine.resign(msg.seat);
         break;
+      case 'abort':
+        this.engine.cancel();
+        break;
       case 'rematch':
         this.engine.reset();
         break;
@@ -311,6 +317,11 @@ export class FourGame implements FourSession {
     if (!this.mySeatValue) return;
     this.engine.resign(this.mySeatValue);
     this.broadcast({ t: 'resign', seat: this.mySeatValue });
+  }
+
+  abort(): void {
+    this.engine.cancel();
+    this.broadcast({ t: 'abort' });
   }
 
   rematch(): void {

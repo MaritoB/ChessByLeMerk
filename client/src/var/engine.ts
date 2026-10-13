@@ -1431,6 +1431,12 @@ export class VarChess {
     this.result = { winner: this.other(color), reason: 'abandono' };
     this.emit();
   }
+
+  cancel(reason = 'Partida cancelada'): void {
+    if (this.result) return;
+    this.result = { winner: 'draw', reason };
+    this.emit();
+  }
 }
 
 function sameAction(a: Action, b: Action): boolean {

@@ -28,4 +28,5 @@ export interface VarSession {
   timeControl?: TimeControl;
   flag?(side: string): void;
   undo?(): boolean;
+  abort?(): void;
 }

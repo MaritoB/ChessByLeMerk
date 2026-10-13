@@ -29,4 +29,5 @@ export interface FourSession {
   roomId?: string;
   timeControl?: TimeControl;
   flag?(side: string): void;
+  abort?(): void;
 }

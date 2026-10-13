@@ -24,4 +24,5 @@ export interface GameSession {
   flag?(side: string): void;
   /** Modo sandbox: se pueden mover libremente las piezas de cualquier color. */
   sandbox?: boolean;
+  abort?(): void;
 }

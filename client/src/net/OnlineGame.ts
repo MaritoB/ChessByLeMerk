@@ -213,6 +213,9 @@ export class OnlineGame {
       case 'resign':
         this.controller.resign(msg.by);
         break;
+      case 'abort':
+        this.controller.cancel();
+        break;
       case 'mistake':
         this.controller.applyRemoteMistake(msg.by);
         break;
@@ -260,6 +263,11 @@ export class OnlineGame {
     if (!color) return;
     this.controller.resign(color);
     this.peer?.send({ type: 'resign', by: color });
+  }
+
+  abort(): void {
+    this.controller.cancel();
+    this.peer?.send({ type: 'abort' });
   }
 
   rematch(): void {

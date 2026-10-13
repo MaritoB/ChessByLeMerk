@@ -484,6 +484,12 @@ export class FourChess {
     this.emit();
   }
 
+  cancel(reason = 'Partida cancelada'): void {
+    if (this.result) return;
+    this.result = { winners: [], reason, draw: true };
+    this.emit();
+  }
+
   ensureTurnValid(): void {
     if (!this.result && this.eliminated.has(this.currentSeat())) this.nextTurn();
   }

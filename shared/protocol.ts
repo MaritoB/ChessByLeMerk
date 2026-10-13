@@ -117,6 +117,11 @@ export interface RestartMsg {
   startFen?: string;
 }
 
+/** Cancela la partida (p. ej. nadie hizo la primera jugada a tiempo). */
+export interface AbortMsg {
+  type: 'abort';
+}
+
 export interface ChatMsg {
   type: 'chat';
   text: string;
@@ -129,6 +134,7 @@ export type NetMessage =
   | MistakeMsg
   | RematchMsg
   | RestartMsg
+  | AbortMsg
   | ChatMsg;
 
 export const MAX_PLAYERS_PER_ROOM = 4;

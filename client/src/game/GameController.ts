@@ -222,6 +222,12 @@ export class GameController {
     this.emit();
   }
 
+  cancel(reason = 'Partida cancelada'): void {
+    if (this.result) return;
+    this.result = { winner: 'draw', reason };
+    this.emit();
+  }
+
   flag(winner: Color, reason: string): void {
     if (this.result) return;
     this.result = { winner, reason };

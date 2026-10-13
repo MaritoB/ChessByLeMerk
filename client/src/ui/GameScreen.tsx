@@ -3,7 +3,7 @@ import type { Color, PieceSymbol, Square } from 'chess.js';
 import { boardFromChess, legalMoves, squareFromIndex, squareIndex } from '../chess/engine';
 import { describeMove, normalize, parseSpokenMove } from '../chess/notation';
 import type { GameSession } from '../game/session';
-import { useControllerState, useInterval } from '../game/hooks';
+import { useControllerState, useInterval, useFirstMoveTimer } from '../game/hooks';
 import { Board, type CellView } from './Board';
 import { VoiceInput } from './VoiceInput';
 import { RoomLink } from './RoomLink';
@@ -122,6 +122,13 @@ export function GameScreen({ session, onExit }: GameScreenProps) {
     onFlag: (side) => session.flag?.(side),
   });
 
+  const firstMove = useFirstMoveTimer(
+    session.online && session.connected,
+    snapshot.history.length,
+    20000,
+    () => session.abort?.(),
+  );
+
   function performMove(from: string, to: string, promotion?: string) {
     const result = session.makeMove(from, to, promotion);
     if (result.ok) {
@@ -223,6 +230,7 @@ export function GameScreen({ session, onExit }: GameScreenProps) {
   const resultText = (() => {
     if (!snapshot.result) return null;
     const { winner, reason } = snapshot.result;
+    if (/cancelada/i.test(reason)) return 'Partida cancelada';
     if (winner === 'draw') return `Tablas (${reason})`;
     const won =
       session.myColor === 'both' ? winner : winner === session.myColor;
@@ -251,6 +259,11 @@ export function GameScreen({ session, onExit }: GameScreenProps) {
 
       <div className="game__body">
         <div className="game__boardwrap">
+          {firstMove.show && !snapshot.finished && (
+            <div className="first-move-banner">
+              Primera jugada: {Math.ceil(firstMove.remaining / 1000)}s (si no, se cancela)
+            </div>
+          )}
           {clockOn && (
             <ClockBar
               white={remaining('w')}

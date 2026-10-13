@@ -16,6 +16,7 @@ import { SkillHelp } from './SkillHelp';
 import { Captured } from './Captured';
 import { ClockBar } from './ClockBar';
 import { useClocks } from '../game/clock';
+import { useFirstMoveTimer } from '../game/hooks';
 import { toggleAnnotation, type Annotation } from './annotations';
 
 export interface VarGameScreenProps {
@@ -259,9 +260,16 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     timeControl: clockTC,
     onFlag: (side) => session.flag?.(side),
   });
+  const firstMove = useFirstMoveTimer(
+    session.online && session.connected,
+    snap.history.length,
+    20000,
+    () => session.abort?.(),
+  );
 
   const resultText = (() => {
     if (!snap.result) return null;
+    if (/cancelada/i.test(snap.result.reason)) return 'Partida cancelada';
     if (snap.result.winner === 'draw') return `Tablas (${snap.result.reason})`;
     const won =
       session.myColor === 'all' ? snap.result.winner : snap.result.winner === session.myColor;
@@ -442,6 +450,11 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
 
       <div className="game__body">
         <div className="game__boardwrap">
+          {firstMove.show && !snap.result && (
+            <div className="first-move-banner">
+              Primera jugada: {Math.ceil(firstMove.remaining / 1000)}s (si no, se cancela)
+            </div>
+          )}
           {clockOn && (
             <ClockBar
               white={clockLeft('w')}

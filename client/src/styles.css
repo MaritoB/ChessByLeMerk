@@ -1390,6 +1390,16 @@ h3 {
   display: flex;
   gap: 0.5rem;
 }
+.first-move-banner {
+  align-self: center;
+  background: rgba(255, 159, 28, 0.18);
+  border: 1px solid rgba(255, 159, 28, 0.6);
+  color: #ffd79a;
+  padding: 0.35rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
 .clocks--four {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

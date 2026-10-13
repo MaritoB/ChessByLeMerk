@@ -23,7 +23,10 @@ interface VarResignMsg {
 interface VarRematchMsg {
   t: 'rematch';
 }
-type VarNetMsg = VarStartMsg | VarActionMsg | VarResignMsg | VarRematchMsg;
+interface VarAbortMsg {
+  t: 'abort';
+}
+type VarNetMsg = VarStartMsg | VarActionMsg | VarResignMsg | VarRematchMsg | VarAbortMsg;
 
 export interface VarGameOptions {
   socket: Socket;
@@ -189,6 +192,10 @@ export class VarGame implements VarSession {
         this.engine.reset();
         this.emit();
         break;
+      case 'abort':
+        this.engine.cancel();
+        this.emit();
+        break;
       default:
         break;
     }
@@ -211,6 +218,11 @@ export class VarGame implements VarSession {
     if (!this.myColorValue) return;
     this.engine.resign(this.myColorValue);
     this.peer?.send({ t: 'resign', color: this.myColorValue });
+  }
+
+  abort(): void {
+    this.engine.cancel();
+    this.peer?.send({ t: 'abort' });
   }
 
   rematch(): void {

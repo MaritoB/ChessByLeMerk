@@ -5,6 +5,7 @@ import type { FourSession } from '../four/session';
 import { Board4 } from './Board4';
 import { RoomLink } from './RoomLink';
 import { useClocks, formatClock } from '../game/clock';
+import { useFirstMoveTimer } from '../game/hooks';
 
 export interface FourGameScreenProps {
   session: FourSession;
@@ -41,6 +42,12 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
     timeControl: clockTC,
     onFlag: (side) => session.flag?.(side),
   });
+  const firstMove = useFirstMoveTimer(
+    session.online && session.phase === 'playing' && session.connected,
+    snap.history.length,
+    20000,
+    () => session.abort?.(),
+  );
   const myTurn = session.mySeat === 'all' || session.mySeat === turn;
   const canPlay =
     !snap.result &&
@@ -110,6 +117,7 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
   const resultText = (() => {
     if (!snap.result) return null;
     const { winners, reason, draw } = snap.result;
+    if (/cancelada/i.test(reason)) return 'Partida cancelada';
     if (draw || winners.length === 0) return `Tablas (${reason})`;
     if (session.format === 'teams') {
       const teamName = winners.includes('red') ? 'Rojos + Amarillos' : 'Azules + Verdes';
@@ -141,6 +149,11 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
 
       <div className="game__body">
         <div className="game__boardwrap game__boardwrap--four">
+          {firstMove.show && !snap.result && (
+            <div className="first-move-banner">
+              Primera jugada: {Math.ceil(firstMove.remaining / 1000)}s (si no, se cancela)
+            </div>
+          )}
           {clockOn && (
             <div className="clocks clocks--four">
               {SEAT_ORDER.map((seat) => (
