@@ -1,0 +1,9 @@
+# Despliegue one-click en Render (https://render.com)
+# Crea un "Web Service" apuntando a tu repo y usara esto.
+services:
+  - type: web
+    name: chess-by-lemerk
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build -w client
+    startCommand: npm start
