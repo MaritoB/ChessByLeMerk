@@ -11,6 +11,7 @@ const ICE_SERVERS: RTCIceServer[] = (() => {
   const servers: RTCIceServer[] = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
   ];
   const env = import.meta.env;
   if (env.VITE_TURN_URL) {
@@ -19,6 +20,16 @@ const ICE_SERVERS: RTCIceServer[] = (() => {
       username: env.VITE_TURN_USER,
       credential: env.VITE_TURN_CRED,
     });
+  } else {
+    // TURN publico de respaldo (OpenRelay/Metered) para conectar tras NAT estricto.
+    // Si configuras VITE_TURN_* en client/.env, estos se omiten.
+    const user = 'openrelayproject';
+    const cred = 'openrelayproject';
+    servers.push(
+      { urls: 'turn:openrelay.metered.ca:80', username: user, credential: cred },
+      { urls: 'turn:openrelay.metered.ca:443', username: user, credential: cred },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: user, credential: cred },
+    );
   }
   return servers;
 })();

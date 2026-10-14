@@ -945,7 +945,7 @@ export class VarChess {
             break;
           }
           case 'k': {
-            if (!this.training) {
+            if (!this.training && !this.transformUsed(color, 'q')) {
               for (const d of KING_OFFSETS) {
                 const t = { f: f + d.f, r: r + d.r };
                 if (!this.isActive(t)) continue;
@@ -1000,13 +1000,10 @@ export class VarChess {
             if (other.rider || other.cargo) continue;
             const c: Cell = { f: ff, r: rr };
             const adjacent = Math.abs(ff - f) <= 1 && Math.abs(rr - r) <= 1;
-            const jump = this.reaches('n', kc, c);
-            if (!adjacent && !jump) continue;
-            if (adjacent && this.leavesKingSafe(color, (b) => { b[rr][ff] = null; })) {
+            // Solo una pieza adyacente puede subirse al caballo (el caballo no se mueve).
+            if (!adjacent) continue;
+            if (this.leavesKingSafe(color, (b) => { b[rr][ff] = null; })) {
               out.push({ kind: 'ride', from: c, to: kc });
-            }
-            if (this.leavesKingSafe(color, (b) => { b[kc.r][kc.f] = null; })) {
-              out.push({ kind: 'ride', from: kc, to: c });
             }
           }
         }
@@ -1302,7 +1299,7 @@ export class VarChess {
         const pawnCell = t.targetId != null ? this.findTopById(t.targetId) : null;
         if (pawnCell) {
           this.board[pawnCell.r][pawnCell.f] = this.mk(t.into, t.color);
-          if (t.into !== 'q') this.transformed[t.color].push(t.into);
+          this.transformed[t.color].push(t.into);
         }
       } else {
         this.board[t.target.r][t.target.f] = this.mk('p', t.color);
