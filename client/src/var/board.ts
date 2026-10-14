@@ -1,23 +1,23 @@
 // Tablero 8x8 generico para variantes (Royale con encogimiento, Skills, etc.).
 // Reutiliza la nomenclatura clasica a1..h8 pero permite casillas inactivas
-// (que actuan como muros) y estado extra por pieza (armadura, carga...).
+// (que actuan como muros) y estado extra por pieza (escudo, carga...).
 
 export type Color = 'w' | 'b';
 export type PieceType = 'p' | 'n' | 'b' | 'r' | 'q' | 'k';
 
 export interface Piece {
+  /** Identidad estable (no cambia al mover/clonar). */
+  id: number;
   type: PieceType;
   color: Color;
-  /** Armadura (peon). */
+  /** Peon: escudo activo (fijo en su casilla e imbatible). */
   shield?: boolean;
-  /** Pieza guarecida dentro (torre). */
+  /** Peon: ya gasto su unico punto de habilidad. */
+  skillUsed?: boolean;
+  /** Pieza guarecida dentro de una torre. */
   cargo?: Piece;
-  /** Jinete encima (peon subido a un caballo). */
+  /** Pieza montada encima de un caballo (jinete). */
   rider?: Piece;
-  /** Si es un arquero a caballo (alfil montado): su modo. */
-  archer?: 'tower' | 'archer';
-  /** La torre tiene un alfil dentro que aun puede disparar una flecha. */
-  cargoArrow?: boolean;
 }
 
 export interface Cell {
@@ -25,36 +25,33 @@ export interface Cell {
   r: number;
 }
 
-export type ArrowMode = 'fast' | 'guided' | 'piercing';
-
+/** Disparo cargado de un alfil (longshot): acierta una sola casilla. */
 export interface Arrow {
   id: number;
   color: Color;
-  mode: ArrowMode;
-  /** Direccion (para fast/piercing): delta unitario. */
-  dir?: Cell;
-  /** Objetivo concreto (para guided). */
-  target?: Cell;
-  /** Origen (el alfil). */
+  /** id de la pieza que dispara (alfil). */
+  shooterId: number;
+  /** Casilla original del disparador (debe quedarse quieto). */
+  anchor: Cell;
+  /** Casilla actual del disparador. */
   origin: Cell;
+  target: Cell;
   turnsLeft: number;
 }
 
 export type Action =
   | { kind: 'move'; from: Cell; to: Cell; promotion?: PieceType }
   | { kind: 'retreat'; from: Cell; to: Cell }
-  | { kind: 'arrow'; from: Cell; mode: ArrowMode; dir?: Cell; target?: Cell }
-  | { kind: 'shelter'; from: Cell; target: Cell }
-  | { kind: 'swap'; from: Cell; to: Cell }
-  | { kind: 'convert'; from: Cell; to: Cell }
-  | { kind: 'mount'; from: Cell; to: Cell; mode: 'tower' | 'archer' }
-  | { kind: 'enterRook'; from: Cell; to: Cell; choice: 'queen' | 'shelter' }
-  | { kind: 'ride'; from: Cell; to: Cell }
+  | { kind: 'longshot'; from: Cell; to: Cell }
+  | { kind: 'shelter'; from: Cell; to: Cell }
   | { kind: 'unshelter'; from: Cell; to: Cell }
+  | { kind: 'spawn'; from: Cell; to: Cell }
+  | { kind: 'ride'; from: Cell; to: Cell }
+  | { kind: 'dismount'; from: Cell; to: Cell; promotion?: PieceType }
   | { kind: 'pawnPush'; from: Cell }
   | { kind: 'transform'; from: Cell; to: Cell; into: PieceType }
-  | { kind: 'warcry'; from: Cell }
-  | { kind: 'defense'; block: boolean };
+  | { kind: 'shield'; from: Cell }
+  | { kind: 'unshield'; from: Cell };
 
 export const SIZE = 8;
 export const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] as const;

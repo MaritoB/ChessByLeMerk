@@ -37,6 +37,12 @@ export interface BoardVarProps {
   dangerKeys?: string[];
   /** Nivel de peligro 0..4 (verde..negro). */
   dangerLevel?: number;
+  /** Casilla del peon que se esta fabricando (reina guarecida). */
+  trainingCell?: string | null;
+  /** Niebla de guerra: casillas visibles (indice r*8+f). Si falta, todo visible. */
+  visible?: boolean[] | null;
+  /** Estilo de tablero con niebla. */
+  fog?: boolean;
 }
 
 const ARROW_COLOR = 'rgba(21, 120, 27, 0.85)';
@@ -57,35 +63,11 @@ const GLYPH: Record<string, string> = {
   p: '\u265F',
 };
 
-const ARROW_GLYPH: Record<string, string> = {
-  '0,1': '\u2191',
-  '0,-1': '\u2193',
-  '1,0': '\u2192',
-  '-1,0': '\u2190',
-  '1,1': '\u2197',
-  '1,-1': '\u2198',
-  '-1,1': '\u2196',
-  '-1,-1': '\u2199',
-};
-
-function arrowSquares(arrows: Arrow[]): Map<string, { kind: 'origin' | 'target' | 'path'; glyph?: string }> {
-  const map = new Map<string, { kind: 'origin' | 'target' | 'path'; glyph?: string }>();
+function arrowSquares(arrows: Arrow[]): Map<string, { kind: 'origin' | 'target'; turns: number }> {
+  const map = new Map<string, { kind: 'origin' | 'target'; turns: number }>();
   for (const arrow of arrows) {
-    map.set(cellKey(arrow.origin), { kind: 'origin' });
-    if ((arrow.mode === 'fast' || arrow.mode === 'piercing') && arrow.dir) {
-      const glyph = ARROW_GLYPH[`${arrow.dir.f},${arrow.dir.r}`];
-      let f = arrow.origin.f + arrow.dir.f;
-      let r = arrow.origin.r + arrow.dir.r;
-      while (f >= 0 && f < SIZE && r >= 0 && r < SIZE) {
-        const k = cellKey({ f, r });
-        const existing = map.get(k);
-        if (!existing || existing.kind === 'path') map.set(k, { kind: 'path', glyph });
-        f += arrow.dir.f;
-        r += arrow.dir.r;
-      }
-    } else if (arrow.mode === 'guided' && arrow.target) {
-      map.set(cellKey(arrow.target), { kind: 'target', glyph: '\u2295' });
-    }
+    map.set(cellKey(arrow.origin), { kind: 'origin', turns: arrow.turnsLeft });
+    map.set(cellKey(arrow.target), { kind: 'target', turns: arrow.turnsLeft });
   }
   return map;
 }
@@ -96,11 +78,6 @@ function PieceNode({ piece, skillReady }: { piece: Piece; skillReady?: boolean }
       <PieceView color={piece.color} type={piece.type} />
       {skillReady && <span className="pv__skill" title="habilidad disponible" />}
       {piece.shield && <img className="pv-badge pv-badge--tl" src="/skills/badges/shield.png" alt="armadura" />}
-      {piece.archer && (
-        <span className="pv-mini pv-mini--br" title="alfil montado">
-          <PieceView color={piece.color} type="b" />
-        </span>
-      )}
       {piece.cargo && (
         <span className="pv-mini pv-mini--br" title="guarecida">
           <PieceView color={piece.cargo.color} type={piece.cargo.type} />
@@ -111,7 +88,6 @@ function PieceNode({ piece, skillReady }: { piece: Piece; skillReady?: boolean }
           <PieceView color={piece.rider.color} type={piece.rider.type} />
         </span>
       )}
-      {piece.cargoArrow && <span className="pv__arrowok" title="dispara desde dentro">{'\u2192'}</span>}
     </span>
   );
 }
@@ -134,6 +110,9 @@ export function BoardVar({
   skillsOn,
   dangerKeys,
   dangerLevel,
+  trainingCell,
+  visible,
+  fog,
 }: BoardVarProps) {
   const flipped = myColor === 'b';
   const arrowMap = arrowSquares(snapshot.arrows);
@@ -218,6 +197,7 @@ export function BoardVar({
       }
       const cell: Cell = { f, r };
       const piece = snapshot.board[r][f];
+      const vis = visible ? visible[r * SIZE + f] : true;
       const dark = !isLight(cell);
       const isSelected = selected && sameCell(selected, cell);
       const isTarget = targetKeys.has(cellKey(cell));
@@ -226,6 +206,7 @@ export function BoardVar({
       const arrow = arrowMap.get(cellKey(cell));
       const dataKey = `${f},${r}`;
       const isDraggingFrom = drag?.from === dataKey;
+      const isTraining = Boolean(trainingCell && trainingCell === dataKey);
       const classes = [
         'sqv',
         dark ? 'sqv--dark' : 'sqv--light',
@@ -234,11 +215,13 @@ export function BoardVar({
         isCheck ? 'sqv--check' : '',
         dangerSet.has(dataKey) ? `sqv--danger sqv--danger-${dangerLevel ?? 0}` : '',
         arrow ? `sqv--arrow-${arrow.kind}` : '',
+        isTraining ? 'sqv--training' : '',
+        !vis ? 'sqv--hidden' : '',
       ]
         .filter(Boolean)
         .join(' ');
 
-      const pieceNode = piece ? (
+      const pieceNode = piece && vis ? (
         <PieceNode
           piece={piece}
           skillReady={Boolean(skillsOn && skillsLeft && skillsLeft[piece.color] && skillsLeft[piece.color][piece.type] > 0)}
@@ -297,7 +280,11 @@ export function BoardVar({
           disabled={disabled}
           aria-label={`${FILES[f]}${r + 1}`}
         >
-          {arrow && arrow.glyph && <span className="arrow-mark">{arrow.glyph}</span>}
+          {arrow && (
+            <span className={`arrow-mark arrow-mark--${arrow.kind}`}>
+              {arrow.kind === 'target' ? `\u2295${arrow.turns}` : '\u2022'}
+            </span>
+          )}
           {pieceNode && !isDraggingFrom && pieceNode}
           {isTarget && !piece && <span className="dotv" />}
           {isTarget && piece && <span className="ringv" />}
@@ -310,7 +297,7 @@ export function BoardVar({
   if (preview && preview.from !== preview.to) annList.push({ kind: 'arrow', from: preview.from, to: preview.to });
 
   return (
-    <div ref={boardRef} className={`bv ${disabled ? 'bv--disabled' : ''}`}>
+    <div ref={boardRef} className={`bv ${disabled ? 'bv--disabled' : ''} ${fog ? 'bv--fog' : ''}`}>
       {cells}
       <svg className="annot" viewBox="0 0 8 8" preserveAspectRatio="none">
         <defs>

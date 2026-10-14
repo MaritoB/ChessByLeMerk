@@ -46,6 +46,7 @@ export function varModeIdOf(id: GameModeId): 'royale' | 'skills' {
   return id === 'skills' ? 'skills' : 'royale';
 }
 
-export { varConfigOf } from './varModes';
+export { varConfigOf, varConfigFrom, type VarMods } from './varModes';
+export { varLabel } from '../var/session';
 
 export type { GameMode } from './types';

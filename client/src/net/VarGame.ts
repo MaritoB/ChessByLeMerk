@@ -176,10 +176,22 @@ export class VarGame implements VarSession {
     this.emit();
   }
 
+  /** Adopta la config enviada por el anfitrion (para partidas combinadas). */
+  private applyConfig(config: VarConfig): void {
+    Object.assign(this.config, config);
+    this.engine.configure({
+      shrinkEvery: config.shrinkEvery,
+      skills: config.skills,
+      shieldPawns: config.shieldPawns,
+    });
+    this.emit();
+  }
+
   private onMessage(msg: VarNetMsg): void {
     switch (msg.t) {
       case 'start':
         if (msg.timeControl) this.timeControlValue = msg.timeControl;
+        if (msg.config) this.applyConfig(msg.config);
         this.begin(msg.white);
         break;
       case 'action':
@@ -203,12 +215,7 @@ export class VarGame implements VarSession {
 
   makeAction(action: Action): boolean {
     if (!this.myColorValue) return false;
-    const pending = this.engine.pendingDefense;
-    if (pending) {
-      if (action.kind !== 'defense' || pending.defenderColor !== this.myColorValue) return false;
-    } else if (this.engine.turn !== this.myColorValue) {
-      return false;
-    }
+    if (this.engine.turn !== this.myColorValue) return false;
     const ok = this.engine.applyAction(action);
     if (ok) this.peer?.send({ t: 'action', action });
     return ok;

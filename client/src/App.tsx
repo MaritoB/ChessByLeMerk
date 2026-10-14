@@ -13,7 +13,7 @@ import { FourChess } from './four/engine';
 import type { FourSession, SeatNames } from './four/session';
 import { VarChess } from './var/engine';
 import type { VarSession } from './var/session';
-import { fourFormatOf, getMode, isFourMode, isVarMode, varConfigOf, varModeIdOf } from './modes';
+import { fourFormatOf, getMode, isFourMode, isVarMode, varConfigFrom, varConfigOf, varModeIdOf, type VarMods } from './modes';
 import { TIME_CONTROLS, type TimeControl } from './game/clock';
 import { Lobby, type OnlineConn } from './ui/Lobby';
 import { GameScreen } from './ui/GameScreen';
@@ -117,8 +117,8 @@ function buildFourLocal(modeId: GameModeId, timeControl: TimeControl): FourSessi
   };
 }
 
-function buildVarLocal(modeId: GameModeId, timeControl: TimeControl): VarSession {
-  const config = varConfigOf(varModeIdOf(modeId));
+function buildVarLocal(modeId: GameModeId, timeControl: TimeControl, mods?: VarMods): VarSession {
+  const config = mods ? varConfigFrom(varModeIdOf(modeId), mods) : varConfigOf(varModeIdOf(modeId));
   const engine = new VarChess({
     shrinkEvery: config.shrinkEvery,
     skills: config.skills,
@@ -206,11 +206,11 @@ export function App() {
     localStorage.setItem('cbl.server', serverUrl);
   }, [serverUrl]);
 
-  function handleStartLocal(modeId: GameModeId) {
+  function handleStartLocal(modeId: GameModeId, mods?: VarMods) {
     if (isFourMode(modeId)) {
       setView({ name: 'four', session: buildFourLocal(modeId, timeControl) });
     } else if (isVarMode(modeId)) {
-      setView({ name: 'var', session: buildVarLocal(modeId, timeControl) });
+      setView({ name: 'var', session: buildVarLocal(modeId, timeControl, mods) });
     } else {
       setView({ name: 'two', session: buildLocalSession(modeId, timeControl) });
     }

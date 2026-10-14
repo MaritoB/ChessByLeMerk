@@ -12,7 +12,6 @@ import {
   squareName,
   type Action,
   type Arrow,
-  type ArrowMode,
   type Cell,
   type Color,
   type Piece,
@@ -24,7 +23,7 @@ export interface VarOptions {
   shrinkEvery?: number;
   /** Activa las habilidades de las piezas. */
   skills?: boolean;
-  /** Los peones empiezan con armadura. */
+  /** Los peones empiezan con escudo activo (por defecto no). */
   shieldPawns?: boolean;
 }
 
@@ -33,21 +32,19 @@ export interface VarResult {
   reason: string;
 }
 
-export interface PendingDefense {
-  attackerFrom: Cell;
-  target: Cell;
-  attackerColor: Color;
-  defenderColor: Color;
-  /** true = la pieza atacada es una torre con pieza guarecida. */
-  isRookBreak: boolean;
-}
-
 export interface HistoryEntry {
   color: Color;
   notation: string;
   action: Action;
   shrunkRing?: boolean;
   captured?: Piece;
+}
+
+/** Entrenamiento/fabricacion en curso (no usa puntos; solo tarda turnos). */
+export interface Training {
+  color: Color;
+  into: PieceType;
+  turnsLeft: number;
 }
 
 export interface VarSnapshot {
@@ -59,8 +56,6 @@ export interface VarSnapshot {
   result: VarResult | null;
   history: HistoryEntry[];
   lastMove: { from: Cell; to: Cell } | null;
-  pendingDefense: PendingDefense | null;
-  skillsLeft: Record<Color, Record<PieceType, number>>;
   moveNumber: number;
   shrinkCount: number;
   canUndo: boolean;
@@ -68,6 +63,10 @@ export interface VarSnapshot {
   nextRing: Cell[];
   /** Progreso hacia el proximo encogimiento (0 = recien encogido, 1 = a punto). */
   shrinkProgress: number;
+  /** Fabricacion/entrenamiento actual. */
+  training: { color: Color; target: Cell; into: PieceType; turnsLeft: number } | null;
+  /** Tipos ya fabricados por cada bando (una pieza de cada tipo por bando). */
+  transformed: Record<Color, PieceType[]>;
 }
 
 interface UndoState {
@@ -75,18 +74,36 @@ interface UndoState {
   active: boolean[][];
   turn: Color;
   arrows: Arrow[];
-  skillsLeft: Record<Color, Record<PieceType, number>>;
   lastMove: { from: Cell; to: Cell } | null;
   result: VarResult | null;
   shrinkCount: number;
   enPassant: Cell | null;
-  pendingDefense: PendingDefense | null;
-  pendingAction: Extract<Action, { kind: 'move' }> | null;
   history: HistoryEntry[];
+  training: InternalTraining | null;
+  transformed: Record<Color, PieceType[]>;
+  nextId: number;
 }
 
 type Listener = (snapshot: VarSnapshot) => void;
 type Board = (Piece | null)[][];
+
+interface InternalTraining {
+  color: Color;
+  kind: 'transform' | 'spawn';
+  source: 'king' | 'rook';
+  sourceId: number;
+  sourceCell: Cell;
+  target: Cell;
+  targetId?: number;
+  into: PieceType;
+  turnsLeft: number;
+}
+
+/** Turnos que tarda cada fabricacion (sin usar puntos). */
+export const KING_QUEEN_TURNS = 4;
+export const SPAWN_TURNS = 2;
+export const FACTORY_TURNS: Record<'n' | 'b' | 'r', number> = { n: 2, b: 2, r: 3 };
+export const LONGSHOT_TURNS = 1;
 
 const START_FEN_ROWS: string[] = [
   'rnbqkbnr',
@@ -105,11 +122,10 @@ function emptyBoard(): Board {
 
 function clonePiece(p: Piece): Piece {
   return {
+    id: p.id,
     type: p.type,
     color: p.color,
     shield: p.shield,
-    archer: p.archer,
-    cargoArrow: p.cargoArrow,
     cargo: p.cargo ? clonePiece(p.cargo) : undefined,
     rider: p.rider ? clonePiece(p.rider) : undefined,
   };
@@ -135,21 +151,15 @@ export class VarChess {
   result: VarResult | null = null;
   history: HistoryEntry[] = [];
   lastMove: { from: Cell; to: Cell } | null = null;
-  pendingDefense: PendingDefense | null = null;
-  skillsLeft: Record<Color, Record<PieceType, number>>;
   shrinkCount = 0;
 
-  private readonly opts: Required<VarOptions>;
+  private opts: Required<VarOptions>;
   private arrowSeq = 1;
-  /** RNG determinista (misma secuencia en ambos clientes). */
-  private rng = 0x2f6e2b1;
+  private nextId = 1;
+  private training: InternalTraining | null = null;
+  private transformed: Record<Color, PieceType[]> = { w: [], b: [] };
   private undoStack: UndoState[] = [];
   private listeners = new Set<Listener>();
-
-  private rand(): number {
-    this.rng = (this.rng * 1664525 + 1013904223) >>> 0;
-    return this.rng / 0x100000000;
-  }
 
   constructor(options: VarOptions = {}) {
     this.opts = {
@@ -160,24 +170,11 @@ export class VarChess {
     this.board = emptyBoard();
     this.active = fullActive();
     this.turn = 'w';
-    this.skillsLeft = { w: this.emptySkills(), b: this.emptySkills() };
     this.setup();
   }
 
-  private emptySkills(): Record<PieceType, number> {
-    return { p: 8, n: 2, b: 2, r: 2, q: 1, k: 1 };
-  }
-
-  /** Cada peon tiene su propio punto de skill (la armadura). */
-  private pawnsWithSkill(color: Color): number {
-    let n = 0;
-    for (let r = 0; r < SIZE; r++) {
-      for (let f = 0; f < SIZE; f++) {
-        const p = this.board[r][f];
-        if (p && p.type === 'p' && p.color === color && p.shield) n += 1;
-      }
-    }
-    return n;
+  private mk(type: PieceType, color: Color, extra: Partial<Piece> = {}): Piece {
+    return { id: this.nextId++, type, color, ...extra };
   }
 
   private setup(): void {
@@ -188,7 +185,7 @@ export class VarChess {
         if (ch === '.') continue;
         const color: Color = ch === ch.toUpperCase() ? 'w' : 'b';
         const type = pieceTypeOf(ch);
-        const piece: Piece = { type, color };
+        const piece = this.mk(type, color);
         if (type === 'p' && this.opts.shieldPawns) piece.shield = true;
         this.board[r][f] = piece;
       }
@@ -203,13 +200,25 @@ export class VarChess {
     this.result = null;
     this.history = [];
     this.lastMove = null;
-    this.pendingDefense = null;
+    this._enPassant = null;
     this.shrinkCount = 0;
-    this.rng = 0x2f6e2b1;
+    this.arrowSeq = 1;
+    this.nextId = 1;
+    this.training = null;
+    this.transformed = { w: [], b: [] };
     this.undoStack = [];
-    this.skillsLeft = { w: this.emptySkills(), b: this.emptySkills() };
     this.setup();
     this.emit();
+  }
+
+  /** Reconfigura el motor (p. ej. al adoptar la config del anfitrion online). */
+  configure(options: VarOptions): void {
+    this.opts = {
+      shrinkEvery: options.shrinkEvery ?? 0,
+      skills: options.skills ?? false,
+      shieldPawns: options.shieldPawns ?? false,
+    };
+    this.reset();
   }
 
   get canUndo(): boolean {
@@ -221,24 +230,18 @@ export class VarChess {
       board: cloneBoard(this.board),
       active: this.active.map((row) => [...row]),
       turn: this.turn,
-      arrows: this.arrows.map((a) => ({
-        ...a,
-        dir: a.dir ? { ...a.dir } : undefined,
-        target: a.target ? { ...a.target } : undefined,
-        origin: { ...a.origin },
-      })),
-      skillsLeft: { w: { ...this.skillsLeft.w }, b: { ...this.skillsLeft.b } },
+      arrows: this.arrows.map((a) => ({ ...a, anchor: { ...a.anchor }, origin: { ...a.origin }, target: { ...a.target } })),
       lastMove: this.lastMove ? { from: { ...this.lastMove.from }, to: { ...this.lastMove.to } } : null,
       result: this.result,
       shrinkCount: this.shrinkCount,
       enPassant: this._enPassant,
-      pendingDefense: this.pendingDefense,
-      pendingAction: this.pendingAction,
       history: [...this.history],
+      training: this.training ? { ...this.training, sourceCell: { ...this.training.sourceCell }, target: { ...this.training.target } } : null,
+      transformed: { w: [...this.transformed.w], b: [...this.transformed.b] },
+      nextId: this.nextId,
     });
   }
 
-  /** Vuelve atras una accion (la ultima, incluida la decision de escudo). */
   undo(): boolean {
     const state = this.undoStack.pop();
     if (!state) return false;
@@ -246,14 +249,14 @@ export class VarChess {
     this.active = state.active;
     this.turn = state.turn;
     this.arrows = state.arrows;
-    this.skillsLeft = state.skillsLeft;
     this.lastMove = state.lastMove;
     this.result = state.result;
     this.shrinkCount = state.shrinkCount;
     this._enPassant = state.enPassant;
-    this.pendingDefense = state.pendingDefense;
-    this.pendingAction = state.pendingAction;
     this.history = state.history;
+    this.training = state.training;
+    this.transformed = state.transformed;
+    this.nextId = state.nextId;
     this.emit();
     return true;
   }
@@ -276,22 +279,34 @@ export class VarChess {
       board: cloneBoard(this.board),
       active: this.active.map((row) => [...row]),
       turn: this.turn,
-      arrows: this.arrows.map((a) => ({ ...a, dir: a.dir ? { ...a.dir } : undefined, target: a.target ? { ...a.target } : undefined, origin: { ...a.origin } })),
+      arrows: this.arrows.map((a) => ({
+        ...a,
+        anchor: { ...a.anchor },
+        origin: { ...a.origin },
+        target: { ...a.target },
+      })),
       check: this.inCheck(this.turn),
       result: this.result,
       history: [...this.history],
       lastMove: this.lastMove ? { from: { ...this.lastMove.from }, to: { ...this.lastMove.to } } : null,
-      pendingDefense: this.pendingDefense,
-      skillsLeft: {
-        w: { ...this.skillsLeft.w, p: this.pawnsWithSkill('w') },
-        b: { ...this.skillsLeft.b, p: this.pawnsWithSkill('b') },
-      },
       moveNumber: this.history.length + 1,
       shrinkCount: this.shrinkCount,
       canUndo: this.undoStack.length > 0,
       nextRing: this.computeNextRing(),
       shrinkProgress:
         this.opts.shrinkEvery > 0 ? (this.history.length % this.opts.shrinkEvery) / this.opts.shrinkEvery : 0,
+      training: this.training
+        ? {
+            color: this.training.color,
+            into: this.training.into,
+            turnsLeft: this.training.turnsLeft,
+            target:
+              this.training.kind === 'spawn'
+                ? { ...this.training.target }
+                : this.findTopById(this.training.targetId ?? -1) ?? { ...this.training.target },
+          }
+        : null,
+      transformed: { w: [...this.transformed.w], b: [...this.transformed.b] },
     };
   }
 
@@ -323,12 +338,26 @@ export class VarChess {
     return this.board[cell.r][cell.f];
   }
 
+  private findTopById(id: number): Cell | null {
+    for (let r = 0; r < SIZE; r++) {
+      for (let f = 0; f < SIZE; f++) {
+        const p = this.board[r][f];
+        if (p && p.id === id) return { f, r };
+      }
+    }
+    return null;
+  }
+
   private enemy(a: Color, b: Color): boolean {
     return a !== b;
   }
 
   private forward(color: Color): number {
     return color === 'w' ? 1 : -1;
+  }
+
+  private adjacent(a: Cell, b: Cell): boolean {
+    return Math.abs(a.f - b.f) <= 1 && Math.abs(a.r - b.r) <= 1 && !sameCell(a, b);
   }
 
   private findKing(board: Board, color: Color): Cell | null {
@@ -339,6 +368,11 @@ export class VarChess {
       }
     }
     return null;
+  }
+
+  /** Un peon con escudo activo no puede ser capturado (el atacante muere). */
+  private isCapturable(p: Piece | null): boolean {
+    return !(p && p.type === 'p' && p.shield);
   }
 
   private attacked(board: Board, target: Cell, by: Color): boolean {
@@ -354,7 +388,7 @@ export class VarChess {
 
   private pieceAttacks(board: Board, from: Cell, p: Piece, target: Cell): boolean {
     if (this.attacksForPiece(board, from, p, target)) return true;
-    if (p.rider && this.attacksForPiece(board, from, { type: p.rider.type, color: p.rider.color }, target)) {
+    if (p.rider && this.attacksForPiece(board, from, { ...p.rider }, target)) {
       return true;
     }
     return false;
@@ -363,21 +397,13 @@ export class VarChess {
   private attacksForPiece(board: Board, from: Cell, p: Piece, target: Cell): boolean {
     const df = target.f - from.f;
     const dr = target.r - from.r;
-    const knightHit = (Math.abs(df) === 1 && Math.abs(dr) === 2) || (Math.abs(df) === 2 && Math.abs(dr) === 1);
     switch (p.type) {
       case 'p': {
         const dir = this.forward(p.color);
         return dr === dir && Math.abs(df) === 1;
       }
-      case 'n': {
-        if (knightHit) return true;
-        if (p.archer === 'tower') {
-          if ((df === 0 || dr === 0) && this.clearPath(board, from, target)) return true;
-        } else if (p.archer === 'archer') {
-          if (Math.abs(df) === Math.abs(dr) && df !== 0 && this.clearPath(board, from, target)) return true;
-        }
-        return false;
-      }
+      case 'n':
+        return (Math.abs(df) === 1 && Math.abs(dr) === 2) || (Math.abs(df) === 2 && Math.abs(dr) === 1);
       case 'k':
         return Math.abs(df) <= 1 && Math.abs(dr) <= 1 && (df !== 0 || dr !== 0);
       case 'b':
@@ -408,7 +434,6 @@ export class VarChess {
     return true;
   }
 
-  /** ¿La pieza `type` en `from` podria llegar a `to` (destino ocupado por el aliado)? */
   private reaches(type: PieceType, from: Cell, to: Cell): boolean {
     const df = to.f - from.f;
     const dr = to.r - from.r;
@@ -422,7 +447,11 @@ export class VarChess {
       case 'r':
         return (df === 0 || dr === 0) && (df !== 0 || dr !== 0) && this.clearPath(this.board, from, to);
       case 'q':
-        return (Math.abs(df) === Math.abs(dr) || df === 0 || dr === 0) && (df !== 0 || dr !== 0) && this.clearPath(this.board, from, to);
+        return (
+          (Math.abs(df) === Math.abs(dr) || df === 0 || dr === 0) &&
+          (df !== 0 || dr !== 0) &&
+          this.clearPath(this.board, from, to)
+        );
       default:
         return false;
     }
@@ -432,6 +461,37 @@ export class VarChess {
     const king = this.findKing(this.board, color);
     if (!king) return false;
     return this.attacked(this.board, king, color === 'w' ? 'b' : 'w');
+  }
+
+  /** Casillas visibles para `color` (niebla de guerra). Indice = r*8+f. */
+  vision(color: Color): boolean[] {
+    const view = new Array<boolean>(SIZE * SIZE).fill(false);
+    const mark = (f: number, r: number) => {
+      if (onBoard(f, r)) view[r * SIZE + f] = true;
+    };
+    const pieces: { from: Cell; p: Piece }[] = [];
+    for (let r = 0; r < SIZE; r++) {
+      for (let f = 0; f < SIZE; f++) {
+        const p = this.board[r][f];
+        if (!p || p.color !== color) continue;
+        mark(f, r);
+        pieces.push({ from: { f, r }, p });
+      }
+    }
+    for (const { from, p } of pieces) {
+      if (p.type === 'p') {
+        const dir = this.forward(color);
+        mark(from.f, from.r + dir);
+        mark(from.f, from.r + dir * 2);
+      }
+      for (let r = 0; r < SIZE; r++) {
+        for (let f = 0; f < SIZE; f++) {
+          if (!this.active[r][f]) continue;
+          if (this.pieceAttacks(this.board, from, p, { f, r })) mark(f, r);
+        }
+      }
+    }
+    return view;
   }
 
   // ---- Generacion de movimientos normales ----
@@ -460,6 +520,7 @@ export class VarChess {
   }
 
   private pawnMoves(list: Action[], from: Cell, p: Piece): void {
+    if (p.shield) return; // peon con escudo: fijo en su lugar
     const dir = this.forward(p.color);
     const startRank = p.color === 'w' ? 1 : 6;
     const promoRank = p.color === 'w' ? 7 : 0;
@@ -561,9 +622,8 @@ export class VarChess {
     const king = this.pieceAt({ f: 4, r: rank });
     if (!king || king.type !== 'k' || king.color !== color) return;
     if (this.inCheck(color)) return;
-    // Enroque corto (h) y largo (a)
     const rookH = this.pieceAt({ f: 7, r: rank });
-    if (rookH && rookH.type === 'r' && rookH.color === color && this.isActive({ f: 7, r: rank })) {
+    if (rookH && rookH.type === 'r' && rookH.color === color && !rookH.cargo && this.isActive({ f: 7, r: rank })) {
       if (
         this.isActive({ f: 5, r: rank }) &&
         this.isActive({ f: 6, r: rank }) &&
@@ -576,7 +636,7 @@ export class VarChess {
       }
     }
     const rookA = this.pieceAt({ f: 0, r: rank });
-    if (rookA && rookA.type === 'r' && rookA.color === color && this.isActive({ f: 0, r: rank })) {
+    if (rookA && rookA.type === 'r' && rookA.color === color && !rookA.cargo && this.isActive({ f: 0, r: rank })) {
       if (
         this.isActive({ f: 1, r: rank }) &&
         this.isActive({ f: 2, r: rank }) &&
@@ -596,6 +656,21 @@ export class VarChess {
     return color === 'w' ? 'b' : 'w';
   }
 
+  /** Movimiento de rebote: salta por encima de un caballo aliado y sigue mas alla. */
+  private bounceMoves(list: Action[], from: Cell, color: Color): void {
+    for (const d of KNIGHT_OFFSETS) {
+      const b: Cell = { f: from.f + d.f, r: from.r + d.r };
+      if (!this.isActive(b)) continue;
+      const ally = this.board[b.r][b.f];
+      if (!ally || ally.color !== color || ally.type !== 'n') continue;
+      for (const d2 of KNIGHT_OFFSETS) {
+        const c: Cell = { f: b.f + d2.f, r: b.r + d2.r };
+        if (sameCell(c, from)) continue;
+        this.addMoveTo(list, this.board, from, c, color);
+      }
+    }
+  }
+
   private pseudoMoves(color: Color): Action[] {
     const list: Action[] = [];
     for (let r = 0; r < SIZE; r++) {
@@ -603,14 +678,6 @@ export class VarChess {
         const p = this.board[r][f];
         if (!p || p.color !== color) continue;
         const from: Cell = { f, r };
-        // Una torre que guarece puede moverse llevando la carga; su carga ataca sin moverse.
-        if (p.type === 'r' && p.cargo) {
-          this.ray(list, from, ORTHO_DIRS, color);
-          for (const cap of this.cargoCaptures(from, p.cargo)) {
-            list.push({ kind: 'move', from: { ...from }, to: cap });
-          }
-          continue;
-        }
         switch (p.type) {
           case 'p':
             this.pawnMoves(list, from, p);
@@ -618,33 +685,18 @@ export class VarChess {
           case 'n':
             for (const d of KNIGHT_OFFSETS) {
               const to = { f: f + d.f, r: r + d.r };
-              if (this.isActive(to) && (!this.pieceAt(to) || this.pieceAt(to)!.color !== color)) {
-                list.push({ kind: 'move', from: { ...from }, to });
-              }
+              this.addMoveTo(list, this.board, from, to, color);
             }
-            if (p.archer === 'tower') {
-              this.ray(list, from, ORTHO_DIRS, color);
-            } else if (p.archer === 'archer') {
-              for (const dir of DIAGONAL_DIRS) {
-                let f2 = f + dir.f;
-                let r2 = r + dir.r;
-                while (onBoard(f2, r2) && this.active[r2][f2]) {
-                  const t = this.board[r2][f2];
-                  if (t) {
-                    if (t.color !== color) list.push({ kind: 'move', from: { ...from }, to: { f: f2, r: r2 } });
-                    break;
-                  }
-                  f2 += dir.f;
-                  r2 += dir.r;
-                }
-              }
-            }
+            this.bounceMoves(list, from, color);
             break;
           case 'b':
             this.ray(list, from, DIAGONAL_DIRS, color);
             break;
           case 'r':
-            this.ray(list, from, ORTHO_DIRS, color);
+            // Una torre con una reina guarecida no se mueve (es la fabrica).
+            if (!(p.cargo && p.cargo.type === 'q')) {
+              this.ray(list, from, ORTHO_DIRS, color);
+            }
             break;
           case 'q':
             this.ray(list, from, ALL_DIRS, color);
@@ -652,9 +704,7 @@ export class VarChess {
           case 'k':
             for (const d of KING_OFFSETS) {
               const to = { f: f + d.f, r: r + d.r };
-              if (this.isActive(to) && (!this.pieceAt(to) || this.pieceAt(to)!.color !== color)) {
-                list.push({ kind: 'move', from: { ...from }, to });
-              }
+              this.addMoveTo(list, this.board, from, to, color);
             }
             break;
           default:
@@ -669,20 +719,6 @@ export class VarChess {
     return list;
   }
 
-  private cargoCaptures(from: Cell, cargo: Piece): Cell[] {
-    const out: Cell[] = [];
-    const fake: Piece = { type: cargo.type, color: cargo.color };
-    for (let r = 0; r < SIZE; r++) {
-      for (let f = 0; f < SIZE; f++) {
-        const t = this.board[r][f];
-        if (!t || t.color === cargo.color) continue;
-        const target: Cell = { f, r };
-        if (this.pieceAttacks(this.board, from, fake, target)) out.push(target);
-      }
-    }
-    return out;
-  }
-
   private leavesKingSafe(color: Color, mutate: (b: Board) => void): boolean {
     const clone = cloneBoard(this.board);
     mutate(clone);
@@ -691,44 +727,8 @@ export class VarChess {
     return !this.attacked(clone, king, this.other(color));
   }
 
-  /** Aplica una jugada normal o una captura de la pieza guarecida. */
   private applySimOn(board: Board, action: Extract<Action, { kind: 'move' }>): void {
-    const mover = board[action.from.r][action.from.f];
-    const target = board[action.to.r][action.to.f];
-    if (mover && mover.type === 'r' && mover.cargo && target) {
-      const rookReach =
-        (action.to.f === action.from.f || action.to.r === action.from.r) &&
-        this.clearPath(board, action.from, action.to);
-      if (!rookReach) {
-        // La carga captura sin que la torre se mueva.
-        board[action.to.r][action.to.f] = null;
-        return;
-      }
-    }
     this.applyMoveOn(board, action);
-  }
-
-  /** Coloca un jinete desmontado en una casilla adyacente libre (al azar). */
-  private dismountRider(around: Cell, rider: Piece, dir?: Cell): void {
-    const free = (c: Cell) => this.isActive(c) && !this.pieceAt(c);
-    const drop = (c: Cell) => {
-      this.board[c.r][c.f] = { type: rider.type, color: rider.color, shield: rider.shield };
-    };
-    // Preferencia: continuar la direccion del ataque.
-    if (dir && (dir.f !== 0 || dir.r !== 0)) {
-      const pref: Cell = { f: around.f + dir.f, r: around.r + dir.r };
-      if (free(pref)) {
-        drop(pref);
-        return;
-      }
-    }
-    const candidates: Cell[] = [];
-    for (const d of KING_OFFSETS) {
-      const t: Cell = { f: around.f + d.f, r: around.r + d.r };
-      if (free(t)) candidates.push(t);
-    }
-    if (candidates.length === 0) return;
-    drop(candidates[Math.floor(this.rand() * candidates.length)]);
   }
 
   /** Empuje de peones doblados: avanzan todos los peones del color en una columna. */
@@ -737,9 +737,8 @@ export class VarChess {
     const pawns: Cell[] = [];
     for (let r = 0; r < SIZE; r++) {
       const p = board[r][file];
-      if (p && p.type === 'p' && p.color === color) pawns.push({ f: file, r });
+      if (p && p.type === 'p' && p.color === color && !p.shield) pawns.push({ f: file, r });
     }
-    // Procesar de delante hacia atras para no chocar.
     pawns.sort((a, b) => (dir > 0 ? b.r - a.r : a.r - b.r));
     for (const c of pawns) {
       const to: Cell = { f: file, r: c.r + dir };
@@ -747,12 +746,9 @@ export class VarChess {
       const occ = board[to.r][to.f];
       if (occ && occ.color === color) continue;
       if (occ) board[to.r][to.f] = null;
-      const pawn = board[c.r][c.f]!;
       board[c.r][c.f] = null;
       const promoted = to.r === (color === 'w' ? 7 : 0);
-      board[to.r][to.f] = promoted
-        ? { type: 'q', color: pawn.color }
-        : { type: 'p', color: pawn.color, shield: pawn.shield };
+      board[to.r][to.f] = promoted ? this.mk('q', color) : this.mk('p', color);
     }
   }
 
@@ -768,7 +764,13 @@ export class VarChess {
   private applyMoveOn(board: Board, action: Extract<Action, { kind: 'move' }>): void {
     const p = board[action.from.r][action.from.f];
     if (!p) return;
-    // En passant
+    const target = board[action.to.r][action.to.f];
+    // Atacar un escudo: el escudo se rompe y el atacante muere (el peon queda).
+    if (target && target.type === 'p' && target.shield) {
+      board[action.from.r][action.from.f] = null;
+      target.shield = false;
+      return;
+    }
     if (
       p.type === 'p' &&
       action.from.f !== action.to.f &&
@@ -784,17 +786,14 @@ export class VarChess {
       moving.shield = undefined;
     }
     board[action.to.r][action.to.f] = moving;
-    // Enroque
     if (p.type === 'k' && Math.abs(action.to.f - action.from.f) === 2) {
       const rank = action.from.r;
       if (action.to.f === 6) {
-        const rook = board[rank][7];
+        board[rank][5] = board[rank][7];
         board[rank][7] = null;
-        board[rank][5] = rook;
       } else if (action.to.f === 2) {
-        const rook = board[rank][0];
+        board[rank][3] = board[rank][0];
         board[rank][0] = null;
-        board[rank][3] = rook;
       }
     }
   }
@@ -822,29 +821,33 @@ export class VarChess {
     return this.computeSkillActions(this.turn);
   }
 
-  private spend(color: Color, type: PieceType): void {
-    this.skillsLeft[color][type] = Math.max(0, this.skillsLeft[color][type] - 1);
-  }
-
-  private addArrows(out: Action[], from: Cell, color: Color): void {
+  private pushLongshots(out: Action[], from: Cell, color: Color): void {
+    const shooter = this.board[from.r][from.f];
+    if (!shooter) return;
+    if (this.arrows.some((a) => a.shooterId === shooter.id)) return; // ya esta cargando
     for (const dir of DIAGONAL_DIRS) {
-      out.push({ kind: 'arrow', from: { ...from }, mode: 'fast', dir: { ...dir } });
-    }
-    for (const dir of DIAGONAL_DIRS) {
-      let f2 = from.f + dir.f;
-      let r2 = from.r + dir.r;
-      while (onBoard(f2, r2)) {
-        const t = this.board[r2][f2];
-        if (!t || t.color !== color) {
-          out.push({ kind: 'arrow', from: { ...from }, mode: 'guided', target: { f: f2, r: r2 } });
+      let f = from.f + dir.f;
+      let r = from.r + dir.r;
+      while (onBoard(f, r)) {
+        const t = this.board[r][f];
+        if (!t || (t.color !== color && this.isCapturable(t))) {
+          out.push({ kind: 'longshot', from: { ...from }, to: { f, r } });
         }
-        f2 += dir.f;
-        r2 += dir.r;
+        f += dir.f;
+        r += dir.r;
       }
     }
-    for (const dir of DIAGONAL_DIRS) {
-      out.push({ kind: 'arrow', from: { ...from }, mode: 'piercing', dir: { ...dir } });
-    }
+  }
+
+  private kingNear(color: Color, cell: Cell): boolean {
+    return KING_OFFSETS.some((d) => {
+      const kp = this.pieceAt({ f: cell.f + d.f, r: cell.r + d.r });
+      return Boolean(kp && kp.color === color && kp.type === 'k');
+    });
+  }
+
+  private transformUsed(color: Color, into: PieceType): boolean {
+    return this.transformed[color].includes(into);
   }
 
   private computeSkillActions(color: Color): Action[] {
@@ -856,134 +859,101 @@ export class VarChess {
         const from: Cell = { f, r };
         switch (p.type) {
           case 'p': {
-            if (!p.shield) break;
-            const to = { f, r: r - this.forward(color) };
-            if (this.isActive(to) && !this.pieceAt(to) && this.leavesKingSafe(color, (b) => {
-              const piece = b[r][f]!;
-              b[r][f] = null;
-              b[to.r][to.f] = { type: 'p', color: piece.color };
-            })) {
-              out.push({ kind: 'retreat', from, to });
+            if (p.shield) {
+              out.push({ kind: 'unshield', from });
+              break;
             }
+            // Ariete: empujon de peones doblados (gratis).
             if (this.pawnsOnFile(color, f) >= 2) {
-              const safePush = this.leavesKingSafe(color, (b) => this.pawnPushOn(b, color, f));
-              if (safePush) out.push({ kind: 'pawnPush', from });
+              if (this.leavesKingSafe(color, (b) => this.pawnPushOn(b, color, f))) {
+                out.push({ kind: 'pawnPush', from });
+              }
+            }
+            // Escudo (no puede activarlo si se esta transformando en reina por el rey).
+            const transforming = this.training?.source === 'king' && this.training.targetId === p.id;
+            if (!transforming) out.push({ kind: 'shield', from });
+            // Retroceder una casilla.
+            const to = { f, r: r - this.forward(color) };
+            if (
+              this.isActive(to) &&
+              !this.pieceAt(to) &&
+              this.leavesKingSafe(color, (b) => {
+                b[r][f] = null;
+                b[to.r][to.f] = { ...p, id: p.id };
+              })
+            ) {
+              out.push({ kind: 'retreat', from, to });
             }
             break;
           }
           case 'b': {
-            if (this.skillsLeft[color].b <= 0) break;
-            this.addArrows(out, from, color);
-            const safe = this.leavesKingSafe(color, (b) => {
-              b[r][f] = null;
-            });
-            if (!safe) break;
-            for (const d of KING_OFFSETS) {
-              const t = { f: f + d.f, r: r + d.r };
-              if (!this.isActive(t)) continue;
-              const other = this.pieceAt(t);
-              if (other && other.color === color && other.type === 'n' && !other.archer) {
-                out.push({ kind: 'mount', from, to: t, mode: 'tower' });
-                out.push({ kind: 'mount', from, to: t, mode: 'archer' });
-              }
-              if (other && other.color === color && other.type === 'r' && !other.cargo) {
-                out.push({ kind: 'enterRook', from, to: t, choice: 'queen' });
-                out.push({ kind: 'enterRook', from, to: t, choice: 'shelter' });
-              }
-            }
+            this.pushLongshots(out, from, color);
             break;
           }
           case 'r': {
-            if (p.cargo) {
-              if (p.cargo.type === 'b' && p.cargoArrow) this.addArrows(out, from, color);
-              // Una reina guarecida transforma un peon adyacente:
-              //  - caballo: siempre
-              //  - alfil: si el peon no tenia punto de skill
-              //  - torre: si el peon conservaba su punto de skill
-              if (p.cargo.type === 'q') {
-                const kingNear = KING_OFFSETS.some((d) => {
-                  const kp = this.pieceAt({ f: f + d.f, r: r + d.r });
-                  return Boolean(kp && kp.color === color && kp.type === 'k');
-                });
-                for (const d of KING_OFFSETS) {
-                  const t = { f: f + d.f, r: r + d.r };
-                  if (!this.isActive(t)) continue;
-                  const other = this.pieceAt(t);
-                  if (!other || other.color !== color || other.type !== 'p') continue;
-                  if (this.leavesKingSafe(color, (b) => { b[t.r][t.f] = { type: 'n', color }; })) {
-                    out.push({ kind: 'transform', from, to: t, into: 'n' });
-                  }
-                  if (!other.shield) {
-                    if (this.leavesKingSafe(color, (b) => { b[t.r][t.f] = { type: 'b', color }; })) {
-                      out.push({ kind: 'transform', from, to: t, into: 'b' });
-                    }
-                  } else if (this.leavesKingSafe(color, (b) => { b[t.r][t.f] = { type: 'r', color }; })) {
-                    out.push({ kind: 'transform', from, to: t, into: 'r' });
-                  }
-                  // Con el rey adyacente, el peon se transforma en reina (gasta el punto del rey).
-                  if (
-                    kingNear &&
-                    this.skillsLeft[color].k > 0 &&
-                    this.leavesKingSafe(color, (b) => { b[t.r][t.f] = { type: 'q', color }; })
-                  ) {
-                    out.push({ kind: 'transform', from, to: t, into: 'q' });
-                  }
-                }
-              }
-              // Un peon guarecido con escudo puede desguarecerse: avanza o come en diagonal.
-              if (p.cargo.type === 'p' && p.cargo.shield) {
-                const dir = this.forward(color);
-                const fwd: Cell = { f, r: r + dir };
-                if (
-                  this.isActive(fwd) &&
-                  !this.pieceAt(fwd) &&
-                  this.leavesKingSafe(color, (b) => { b[fwd.r][fwd.f] = { type: 'p', color, shield: true }; })
-                ) {
-                  out.push({ kind: 'unshelter', from, to: fwd });
-                }
-                for (const df of [-1, 1]) {
-                  const t: Cell = { f: f + df, r: r + dir };
-                  if (!this.isActive(t)) continue;
-                  const target = this.pieceAt(t);
-                  if (
-                    target &&
-                    this.enemy(target.color, color) &&
-                    this.leavesKingSafe(color, (b) => { b[t.r][t.f] = { type: 'p', color, shield: true }; })
-                  ) {
-                    out.push({ kind: 'unshelter', from, to: t });
-                  }
-                }
-              }
-              break;
+            if (p.cargo?.type === 'b') {
+              // Alfil guarecido: longshot instantaneo.
+              this.pushLongshots(out, from, color);
             }
-            if (this.skillsLeft[color].r <= 0) break;
-            for (let rr = 0; rr < SIZE; rr++) {
-              for (let ff = 0; ff < SIZE; ff++) {
-                if (ff === f && rr === r) continue;
-                const other = this.board[rr][ff];
-                if (!other || other.color !== color) continue;
-                if (other.type === 'k' || other.type === 'p') continue;
-                if (!this.reaches(other.type, { f: ff, r: rr }, from)) continue;
-                if (this.leavesKingSafe(color, (b) => {
-                  b[rr][ff] = null;
-                })) {
-                  out.push({ kind: 'shelter', from, target: { f: ff, r: rr } });
+            if (p.cargo?.type === 'q' && !this.training) {
+              // Fabrica de la reina (la torre se queda quieta mientras fabrica).
+              for (const d of KING_OFFSETS) {
+                const t = { f: f + d.f, r: r + d.r };
+                if (!this.isActive(t)) continue;
+                if (!this.pieceAt(t)) out.push({ kind: 'spawn', from, to: t });
+                const pawn = this.pieceAt(t);
+                if (pawn && pawn.color === color && pawn.type === 'p') {
+                  for (const into of ['n', 'b', 'r'] as PieceType[]) {
+                    if (this.transformUsed(color, into)) continue;
+                    out.push({ kind: 'transform', from, to: t, into });
+                  }
+                }
+              }
+            }
+            if (p.cargo) {
+              // Desguarecer: la torre suelta la pieza a una casilla libre adyacente.
+              for (const d of KING_OFFSETS) {
+                const t = { f: f + d.f, r: r + d.r };
+                if (!this.isActive(t) || this.pieceAt(t)) continue;
+                if (
+                  this.leavesKingSafe(color, (b) => {
+                    const rook = b[r][f]!;
+                    const cargo = rook.cargo!;
+                    rook.cargo = undefined;
+                    b[t.r][t.f] = { ...cargo };
+                  })
+                ) {
+                  out.push({ kind: 'unshelter', from, to: t });
+                }
+              }
+            }
+            if (!p.cargo) {
+              // Guarecer cualquier pieza aliada a la que la torre pueda llegar moviendose.
+              for (let rr = 0; rr < SIZE; rr++) {
+                for (let ff = 0; ff < SIZE; ff++) {
+                  const other = this.board[rr][ff];
+                  if (!other || other.color !== color) continue;
+                  if (other.type === 'k' || other.type === 'p') continue;
+                  const c: Cell = { f: ff, r: rr };
+                  if (!this.reaches(other.type, c, from)) continue;
+                  if (this.leavesKingSafe(color, (b) => { b[rr][ff] = null; })) {
+                    out.push({ kind: 'shelter', from: c, to: from });
+                  }
                 }
               }
             }
             break;
           }
           case 'k': {
-            if (this.skillsLeft[color].k <= 0) break;
-            const queen = this.findQueen(color);
-            if (queen) out.push({ kind: 'swap', from, to: queen });
-            out.push({ kind: 'warcry', from });
-            break;
-          }
-          case 'q': {
-            if (this.skillsLeft[color].q <= 0) break;
-            for (const target of this.convertTargets(from, color)) {
-              out.push({ kind: 'convert', from, to: target });
+            if (!this.training) {
+              for (const d of KING_OFFSETS) {
+                const t = { f: f + d.f, r: r + d.r };
+                if (!this.isActive(t)) continue;
+                const pawn = this.pieceAt(t);
+                if (pawn && pawn.color === color && pawn.type === 'p') {
+                  out.push({ kind: 'transform', from, to: t, into: 'q' });
+                }
+              }
             }
             break;
           }
@@ -993,54 +963,53 @@ export class VarChess {
       }
     }
 
-    // Combinar con caballos: cualquier pieza aliada adyacente (salvo el rey),
-    // en ambas direcciones (la pieza sube al caballo o el caballo sube a la pieza).
+    // Caballos: montura unica (jinete), desmontar y rebote ya en movimientos.
     for (let r = 0; r < SIZE; r++) {
       for (let f = 0; f < SIZE; f++) {
         const knight = this.board[r][f];
         if (!knight || knight.color !== color || knight.type !== 'n') continue;
-        if (knight.archer || knight.rider) continue;
         const kc: Cell = { f, r };
-        for (const d of KING_OFFSETS) {
-          const t: Cell = { f: f + d.f, r: r + d.r };
-          if (!this.isActive(t)) continue;
-          const other = this.pieceAt(t);
-          if (!other || other.color !== color || other.type === 'k' || other.rider) continue;
-          if (this.leavesKingSafe(color, (b) => { b[t.r][t.f] = null; })) {
-            out.push({ kind: 'ride', from: t, to: kc });
+        if (knight.rider) {
+          const rider = knight.rider;
+          const promoRank = rider.color === 'w' ? 7 : 0;
+          for (const d of KING_OFFSETS) {
+            const t = { f: f + d.f, r: r + d.r };
+            if (!this.isActive(t) || this.pieceAt(t)) continue;
+            const safe = this.leavesKingSafe(color, (b) => {
+              const k = b[kc.r][kc.f]!;
+              const r2 = k.rider!;
+              k.rider = undefined;
+              b[t.r][t.f] = { ...r2 };
+            });
+            if (!safe) continue;
+            if (rider.type === 'p' && t.r === promoRank) {
+              for (const promo of ['q', 'r', 'b', 'n'] as PieceType[]) {
+                out.push({ kind: 'dismount', from: kc, to: t, promotion: promo });
+              }
+            } else {
+              out.push({ kind: 'dismount', from: kc, to: t });
+            }
           }
-          if (this.leavesKingSafe(color, (b) => { b[kc.r][kc.f] = null; })) {
-            out.push({ kind: 'ride', from: kc, to: t });
+          continue;
+        }
+        for (let rr = 0; rr < SIZE; rr++) {
+          for (let ff = 0; ff < SIZE; ff++) {
+            if (ff === f && rr === r) continue;
+            const other = this.board[rr][ff];
+            if (!other || other.color !== color || other.type === 'k') continue;
+            if (other.rider || other.cargo) continue;
+            const c: Cell = { f: ff, r: rr };
+            const adjacent = Math.abs(ff - f) <= 1 && Math.abs(rr - r) <= 1;
+            const jump = this.reaches('n', kc, c);
+            if (!adjacent && !jump) continue;
+            if (adjacent && this.leavesKingSafe(color, (b) => { b[rr][ff] = null; })) {
+              out.push({ kind: 'ride', from: c, to: kc });
+            }
+            if (this.leavesKingSafe(color, (b) => { b[kc.r][kc.f] = null; })) {
+              out.push({ kind: 'ride', from: kc, to: c });
+            }
           }
         }
-      }
-    }
-    return out;
-  }
-
-  private findQueen(color: Color): Cell | null {
-    for (let r = 0; r < SIZE; r++) {
-      for (let f = 0; f < SIZE; f++) {
-        const p = this.board[r][f];
-        if (p && p.type === 'q' && p.color === color) return { f, r };
-      }
-    }
-    return null;
-  }
-
-  private convertTargets(from: Cell, color: Color): Cell[] {
-    const out: Cell[] = [];
-    for (const dir of ALL_DIRS) {
-      let f = from.f + dir.f;
-      let r = from.r + dir.r;
-      while (onBoard(f, r) && this.active[r][f]) {
-        const p = this.board[r][f];
-        if (p) {
-          if (p.color !== color && p.type !== 'q') out.push({ f, r });
-          break;
-        }
-        f += dir.f;
-        r += dir.r;
       }
     }
     return out;
@@ -1048,11 +1017,6 @@ export class VarChess {
 
   applyAction(action: Action): boolean {
     if (this.result) return false;
-    if (this.pendingDefense) {
-      if (action.kind === 'defense') return this.resolveDefense(action.block);
-      return false;
-    }
-    if (action.kind === 'defense') return false;
 
     if (action.kind === 'move') {
       const legal = this.legalMoves().some(
@@ -1078,53 +1042,81 @@ export class VarChess {
       case 'retreat': {
         const piece = this.board[action.from.r][action.from.f]!;
         this.board[action.from.r][action.from.f] = null;
-        this.board[action.to.r][action.to.f] = { type: piece.type, color: piece.color };
+        this.board[action.to.r][action.to.f] = this.mk('p', piece.color, { id: piece.id });
         this.record(color, `retrocede ${squareName(action.to)}`, action);
         this.finishTurn();
         return;
       }
-      case 'arrow': {
-        const arrow: Arrow = {
-          id: this.arrowSeq++,
-          color,
-          mode: action.mode,
-          dir: action.dir,
-          target: action.target,
-          origin: { ...action.from },
-          turnsLeft: action.mode === 'fast' ? 1 : action.mode === 'guided' ? 2 : 3,
-        };
-        this.arrows.push(arrow);
-        const shooter = this.board[action.from.r][action.from.f];
-        if (shooter && shooter.type === 'r' && shooter.cargo?.type === 'b') {
-          shooter.cargoArrow = false;
+      case 'longshot': {
+        const shooter = this.board[action.from.r][action.from.f]!;
+        const sheltered = shooter.type === 'r' && shooter.cargo?.type === 'b';
+        if (sheltered) {
+          // Instantaneo: el alfil guarecido dispara ya mismo.
+          this.fireAt(action.to, color);
+          this.record(color, `longshot instantaneo a ${squareName(action.to)}`, action);
         } else {
-          this.spend(color, 'b');
+          this.arrows.push({
+            id: this.arrowSeq++,
+            color,
+            shooterId: shooter.id,
+            anchor: { ...action.from },
+            origin: { ...action.from },
+            target: { ...action.to },
+            turnsLeft: LONGSHOT_TURNS,
+          });
+          this.record(color, `carga longshot a ${squareName(action.to)}`, action);
         }
-        this.record(color, `flecha ${action.mode}`, action);
         this.finishTurn();
         return;
       }
-      case 'mount': {
-        const knight = this.board[action.to.r][action.to.f]!;
-        this.board[action.from.r][action.from.f] = null;
-        knight.archer = action.mode;
-        this.spend(color, 'b');
-        this.record(color, `alfil monta en caballo (${action.mode})`, action);
+      case 'shield': {
+        const piece = this.board[action.from.r][action.from.f];
+        if (!piece) return;
+        piece.shield = true;
+        this.record(color, `activa escudo en ${squareName(action.from)}`, action);
         this.finishTurn();
         return;
       }
-      case 'enterRook': {
+      case 'unshield': {
+        const piece = this.board[action.from.r][action.from.f];
+        if (!piece) return;
+        piece.shield = false;
+        this.record(color, `baja escudo en ${squareName(action.from)}`, action);
+        this.finishTurn();
+        return;
+      }
+      case 'shelter': {
+        const piece = this.board[action.from.r][action.from.f]!;
         const rook = this.board[action.to.r][action.to.f]!;
+        rook.cargo = clonePiece(piece);
         this.board[action.from.r][action.from.f] = null;
-        if (action.choice === 'queen') {
-          this.board[action.to.r][action.to.f] = { type: 'q', color };
-          this.record(color, `alfil+torre = reina`, action);
-        } else {
-          rook.cargo = { type: 'b', color };
-          rook.cargoArrow = true;
-          this.record(color, `alfil se guarece en la torre`, action);
-        }
-        this.spend(color, 'b');
+        this.record(color, `se guarece en ${squareName(action.to)}`, action);
+        this.finishTurn();
+        return;
+      }
+      case 'unshelter': {
+        const rook = this.board[action.from.r][action.from.f];
+        if (!rook || !rook.cargo) return;
+        const cargo = rook.cargo;
+        rook.cargo = undefined;
+        this.board[action.to.r][action.to.f] = clonePiece(cargo);
+        this.record(color, `desguarece en ${squareName(action.to)}`, action);
+        this.finishTurn();
+        return;
+      }
+      case 'spawn': {
+        const rook = this.board[action.from.r][action.from.f]!;
+        this.training = {
+          color,
+          kind: 'spawn',
+          source: 'rook',
+          sourceId: rook.id,
+          sourceCell: { ...action.from },
+          target: { ...action.to },
+          into: 'p',
+          turnsLeft: SPAWN_TURNS,
+        };
+        this.record(color, `fabrica un peon en ${squareName(action.to)}`, action);
         this.finishTurn();
         return;
       }
@@ -1134,90 +1126,54 @@ export class VarChess {
         if (!a || !b || a === b) return;
         const knight = a.type === 'n' ? a : b;
         const other = a.type === 'n' ? b : a;
+        if (knight.rider) return;
         const mount = clonePiece(knight);
-        mount.rider = { type: other.type, color: other.color, shield: other.shield };
+        mount.rider = clonePiece(other);
         this.board[action.from.r][action.from.f] = null;
         this.board[action.to.r][action.to.f] = mount;
         this.record(color, `${other.type} se combina con el caballo`, action);
         this.finishTurn();
         return;
       }
-      case 'pawnPush': {
-        const ram = this.board[action.from.r][action.from.f];
-        if (ram) ram.shield = false;
-        this.pawnPushOn(this.board, color, action.from.f);
-        this.record(color, `empujon de peones doblados`, action);
-        this.finishTurn();
-        return;
-      }
-      case 'shelter': {
-        const rook = this.board[action.from.r][action.from.f]!;
-        const cargo = this.board[action.target.r][action.target.f]!;
-        this.board[action.target.r][action.target.f] = null;
-        rook.cargo = { type: cargo.type, color: cargo.color, shield: cargo.shield };
-        this.spend(color, 'r');
-        this.record(color, `guarece en ${squareName(action.from)}`, action);
-        this.finishTurn();
-        return;
-      }
-      case 'unshelter': {
-        const rook = this.board[action.from.r][action.from.f];
-        if (!rook || !rook.cargo) return;
-        const cargo = rook.cargo;
-        rook.cargo = undefined;
-        rook.cargoArrow = undefined;
-        this.board[action.to.r][action.to.f] = { type: 'p', color, shield: cargo.shield };
-        this.record(color, `desguarece el peon en ${squareName(action.to)}`, action);
-        this.finishTurn();
-        return;
-      }
-      case 'swap': {
-        const king = this.board[action.from.r][action.from.f]!;
-        const queen = this.board[action.to.r][action.to.f]!;
-        this.board[action.from.r][action.from.f] = queen;
-        this.board[action.to.r][action.to.f] = king;
-        this.spend(color, 'k');
-        this.record(color, `permuta rey/reina`, action);
-        this.finishTurn();
-        return;
-      }
-      case 'convert': {
-        const target = this.board[action.to.r][action.to.f];
-        if (!target) return;
-        const converted: Piece = { type: target.type, color };
-        this.board[action.to.r][action.to.f] = converted;
-        this.spend(color, 'q');
-        if (this.inCheck(this.other(color))) {
-          this.board[action.to.r][action.to.f] = null;
-          this.record(color, `convierte y muere en ${squareName(action.to)}`, action);
-        } else {
-          this.record(color, `convierte ${squareName(action.to)}`, action);
+      case 'dismount': {
+        const knight = this.board[action.from.r][action.from.f];
+        if (!knight || !knight.rider) return;
+        const rider = knight.rider;
+        knight.rider = undefined;
+        const placed = clonePiece(rider);
+        const promoRank = rider.color === 'w' ? 7 : 0;
+        if (rider.type === 'p' && action.to.r === promoRank) {
+          placed.type = action.promotion ?? 'q';
         }
+        this.board[action.to.r][action.to.f] = placed;
+        this.record(color, `desmonta en ${squareName(action.to)}`, action);
+        this.finishTurn();
+        return;
+      }
+      case 'pawnPush': {
+        this.pawnPushOn(this.board, color, action.from.f);
+        this.record(color, `empujon (ariete) de peones doblados`, action);
         this.finishTurn();
         return;
       }
       case 'transform': {
+        const source = this.board[action.from.r][action.from.f];
         const pawn = this.board[action.to.r][action.to.f];
-        if (!pawn || pawn.type !== 'p') return;
-        this.board[action.to.r][action.to.f] = { type: action.into, color };
-        // La dama guarecida NO gasta su punto al transformar en n/b/r; en reina lo paga el rey.
-        if (action.into === 'q') this.spend(color, 'k');
-        this.record(color, `transforma ${squareName(action.to)} en ${action.into}`, action);
-        this.finishTurn();
-        return;
-      }
-      case 'warcry': {
-        const caps: Record<PieceType, number> = { p: 8, n: 2, b: 2, r: 2, q: 1, k: 1 };
-        for (const d of KING_OFFSETS) {
-          const t = { f: action.from.f + d.f, r: action.from.r + d.r };
-          if (!this.isActive(t)) continue;
-          const unit = this.pieceAt(t);
-          if (unit && unit.color === color) {
-            this.skillsLeft[color][unit.type] = Math.min(caps[unit.type], this.skillsLeft[color][unit.type] + 1);
-          }
-        }
-        this.spend(color, 'k');
-        this.record(color, 'grito de guerra', action);
+        if (!source || !pawn || pawn.type !== 'p') return;
+        const isKing = source.type === 'k';
+        const turnsLeft = action.into === 'q' ? KING_QUEEN_TURNS : FACTORY_TURNS[action.into as 'n' | 'b' | 'r'];
+        this.training = {
+          color,
+          kind: 'transform',
+          source: isKing ? 'king' : 'rook',
+          sourceId: source.id,
+          sourceCell: { ...action.from },
+          target: { ...action.to },
+          targetId: pawn.id,
+          into: action.into,
+          turnsLeft,
+        };
+        this.record(color, `entrena ${action.into} en ${squareName(action.to)}`, action);
         this.finishTurn();
         return;
       }
@@ -1227,71 +1183,39 @@ export class VarChess {
   }
 
   private performMove(action: Extract<Action, { kind: 'move' }>, color: Color): void {
-    const mover = this.board[action.from.r][action.from.f];
     const target = this.board[action.to.r][action.to.f];
-    const isCargo = Boolean(mover && mover.type === 'r' && mover.cargo);
-    const special = target && (target.shield || (target.type === 'r' && target.cargo));
-    if (this.opts.skills && special) {
-      this.pendingDefense = {
-        attackerFrom: { ...action.from },
-        target: { ...action.to },
-        attackerColor: color,
-        defenderColor: this.other(color),
-        isRookBreak: Boolean(target.type === 'r' && target.cargo),
-      };
-      this.pendingAction = action;
-      this.emit();
+    const shieldAttack = Boolean(target && target.type === 'p' && target.shield);
+    this.applySimOn(this.board, action);
+    if (shieldAttack) {
+      this.record(color, `rompe el escudo en ${squareName(action.to)}`, action);
+      this.finishTurn();
       return;
     }
-    const rider = target?.rider ? clonePiece(target.rider) : undefined;
-    this.applySimOn(this.board, action);
-    // El jinete solo desmonta si es un peon con escudo; el resto muere con el caballo.
-    if (rider && rider.type === 'p' && rider.shield) {
-      const dir = { f: Math.sign(action.to.f - action.from.f), r: Math.sign(action.to.r - action.from.r) };
-      this.dismountRider(action.to, rider, dir);
+    // Capturar una torre con pieza guarecida: mueren las dos.
+    if (target?.rider && target.rider.type === 'p') {
+      this.dropRider(action.to, action.from, target.rider);
     }
-    this._enPassant = isCargo ? null : this.enPassantAfter(action);
+    this._enPassant = this.enPassantAfter(action);
     this.record(color, this.moveNotation(action), action, target ?? undefined);
     this.finishTurn();
   }
 
-  private pendingAction: Extract<Action, { kind: 'move' }> | null = null;
-
-  private resolveDefense(block: boolean): boolean {
-    const pending = this.pendingDefense;
-    const action = this.pendingAction;
-    if (!pending || !action) return false;
-    const targetPiece = this.board[pending.target.r][pending.target.f];
-    if (block) {
-      if (pending.isRookBreak) {
-        // El atacante vuelve; la torre se rompe y la pieza guarecida queda en su lugar.
-        const cargo = targetPiece?.cargo;
-        this.board[pending.target.r][pending.target.f] = cargo ? clonePiece(cargo) : null;
-      } else if (targetPiece) {
-        targetPiece.shield = false;
-        const left = this.skillsLeft[pending.defenderColor];
-        if (left) left.p = Math.max(0, left.p - 1);
-      }
-    } else {
-      const mover = this.board[pending.attackerFrom.r][pending.attackerFrom.f];
-      if (mover && mover.type === 'r' && mover.cargo) {
-        // La pieza guarecida captura sin moverse.
-        this.board[pending.target.r][pending.target.f] = null;
-      } else {
-        this.applyMoveOn(this.board, action);
-        this._enPassant = this.enPassantAfter(action);
+  /** Un peon jinete cuyo caballo es capturado cae a la casilla en la direccion del ataque. */
+  private dropRider(knight: Cell, attacker: Cell, rider: Piece): void {
+    const dir = { f: Math.sign(knight.f - attacker.f), r: Math.sign(knight.r - attacker.r) };
+    const free = (c: Cell) => this.isActive(c) && !this.pieceAt(c);
+    const pref: Cell = { f: knight.f + dir.f, r: knight.r + dir.r };
+    if (free(pref)) {
+      this.board[pref.r][pref.f] = clonePiece(rider);
+      return;
+    }
+    for (const d of KING_OFFSETS) {
+      const c: Cell = { f: knight.f + d.f, r: knight.r + d.r };
+      if (free(c)) {
+        this.board[c.r][c.f] = clonePiece(rider);
+        return;
       }
     }
-    this.pendingDefense = null;
-    this.pendingAction = null;
-    this.record(
-      pending.attackerColor,
-      block ? 'bloqueo' : this.moveNotation(action),
-      action,
-      block ? undefined : targetPiece ?? undefined,
-    );
-    this.finishTurn();
-    return true;
   }
 
   private enPassantAfter(action: Extract<Action, { kind: 'move' }>): Cell | null {
@@ -1305,8 +1229,6 @@ export class VarChess {
   private moveNotation(action: Extract<Action, { kind: 'move' }>): string {
     const p = this.board[action.to.r][action.to.f];
     const letter = p && p.type !== 'p' ? p.type.toUpperCase() : '';
-    const before = this.board[action.from.r]?.[action.from.f];
-    void before;
     return `${letter}${squareName(action.to)}`;
   }
 
@@ -1326,7 +1248,9 @@ export class VarChess {
   }
 
   private processTurnStart(): void {
-    // Disparar flechas del jugador al que le toca.
+    this.validateArrows();
+    this.progressTraining();
+
     const due = this.arrows.filter((a) => a.color === this.turn);
     for (const arrow of due) {
       arrow.turnsLeft -= 1;
@@ -1335,39 +1259,69 @@ export class VarChess {
     this.arrows = this.arrows.filter((a) => a.turnsLeft > 0);
   }
 
-  private fireArrow(arrow: Arrow): void {
-    const kills: Cell[] = [];
-    if (arrow.mode === 'fast' && arrow.dir) {
-      let f = arrow.origin.f + arrow.dir.f;
-      let r = arrow.origin.r + arrow.dir.r;
-      while (onBoard(f, r) && this.active[r][f]) {
-        const p = this.board[r][f];
-        if (p) {
-          if (p.color !== arrow.color) kills.push({ f, r });
-          break;
-        }
-        f += arrow.dir.f;
-        r += arrow.dir.r;
-      }
-    } else if (arrow.mode === 'guided' && arrow.target) {
-      const p = this.board[arrow.target.r][arrow.target.f];
-      if (p && p.color !== arrow.color) kills.push({ ...arrow.target });
-    } else if (arrow.mode === 'piercing' && arrow.dir) {
-      let f = arrow.origin.f + arrow.dir.f;
-      let r = arrow.origin.r + arrow.dir.r;
-      while (onBoard(f, r) && this.active[r][f]) {
-        if (this.board[r][f]) kills.push({ f, r });
-        f += arrow.dir.f;
-        r += arrow.dir.r;
-      }
-    }
-    for (const cell of kills) {
+  private validateArrows(): void {
+    this.arrows = this.arrows.filter((a) => {
+      const cell = this.findTopById(a.shooterId);
+      if (!cell || !sameCell(cell, a.anchor)) return false;
       const p = this.board[cell.r][cell.f];
-      if (p && p.type === 'k') {
-        this.result = { winner: arrow.color, reason: 'flecha al rey' };
+      return Boolean(p && p.type === 'b' && p.color === a.color);
+    });
+  }
+
+  private progressTraining(): void {
+    const t = this.training;
+    if (!t) return;
+    const srcCell = this.findTopById(t.sourceId);
+    let ok = Boolean(srcCell);
+    if (ok && srcCell) {
+      const src = this.board[srcCell.r][srcCell.f]!;
+      if (t.source === 'rook') {
+        ok = src.type === 'r' && src.cargo?.type === 'q' && sameCell(srcCell, t.sourceCell);
+      } else {
+        ok = src.type === 'k' && src.color === t.color;
       }
-      this.board[cell.r][cell.f] = null;
     }
+    if (ok && t.kind === 'transform') {
+      const pawnCell = t.targetId != null ? this.findTopById(t.targetId) : null;
+      const pawn = pawnCell ? this.board[pawnCell.r][pawnCell.f] : null;
+      ok = Boolean(pawn && pawn.type === 'p' && pawn.color === t.color);
+      if (ok && pawnCell) {
+        ok = t.source === 'king' ? this.kingNear(t.color, pawnCell) : this.adjacent(t.sourceCell, pawnCell);
+      }
+    } else if (ok && t.kind === 'spawn') {
+      ok = this.isActive(t.target) && !this.pieceAt(t.target);
+    }
+    if (!ok) {
+      this.training = null;
+      return;
+    }
+    if (t.color !== this.turn) return;
+    t.turnsLeft -= 1;
+    if (t.turnsLeft <= 0) {
+      if (t.kind === 'transform') {
+        const pawnCell = t.targetId != null ? this.findTopById(t.targetId) : null;
+        if (pawnCell) {
+          this.board[pawnCell.r][pawnCell.f] = this.mk(t.into, t.color);
+          if (t.into !== 'q') this.transformed[t.color].push(t.into);
+        }
+      } else {
+        this.board[t.target.r][t.target.f] = this.mk('p', t.color);
+      }
+      this.training = null;
+    }
+  }
+
+  private fireAt(target: Cell, color: Color): void {
+    const p = this.board[target.r][target.f];
+    if (!p) return;
+    if (p.color === color) return;
+    if (!this.isCapturable(p)) return;
+    if (p.type === 'k') this.result = { winner: color, reason: 'longshot al rey' };
+    this.board[target.r][target.f] = null;
+  }
+
+  private fireArrow(arrow: Arrow): void {
+    this.fireAt(arrow.target, arrow.color);
   }
 
   private shrinkRing(): void {
@@ -1387,11 +1341,10 @@ export class VarChess {
         }
       }
     }
-    // Recalcular castling/reyes eliminados.
     for (const cell of removed) {
       const p = this.board[cell.r][cell.f];
       if (p && p.type === 'k') {
-        this.result = { winner: this.other(p.color), reason: 'el tablero engulló al rey' };
+        this.result = { winner: this.other(p.color), reason: 'el tablero engullo al rey' };
       }
       this.board[cell.r][cell.f] = null;
     }
@@ -1444,43 +1397,40 @@ function sameAction(a: Action, b: Action): boolean {
   if (a.kind === 'move' && b.kind === 'move') {
     return sameCell(a.from, b.from) && sameCell(a.to, b.to) && a.promotion === b.promotion;
   }
-  if (a.kind === 'arrow' && b.kind === 'arrow') {
-    return a.mode === b.mode && sameCell(a.from, b.from) && eqCell(a.dir, b.dir) && eqCell(a.target, b.target);
-  }
   if (a.kind === 'shelter' && b.kind === 'shelter') {
-    return sameCell(a.from, b.from) && sameCell(a.target, b.target);
-  }
-  if (a.kind === 'mount' && b.kind === 'mount') {
-    return sameCell(a.from, b.from) && sameCell(a.to, b.to) && a.mode === b.mode;
-  }
-  if (a.kind === 'enterRook' && b.kind === 'enterRook') {
-    return sameCell(a.from, b.from) && sameCell(a.to, b.to) && a.choice === b.choice;
-  }
-  if (a.kind === 'ride' && b.kind === 'ride') {
     return sameCell(a.from, b.from) && sameCell(a.to, b.to);
-  }
-  if (a.kind === 'pawnPush' && b.kind === 'pawnPush') {
-    return sameCell(a.from, b.from);
   }
   if (a.kind === 'unshelter' && b.kind === 'unshelter') {
     return sameCell(a.from, b.from) && sameCell(a.to, b.to);
   }
-  if (a.kind === 'warcry' && b.kind === 'warcry') {
+  if (a.kind === 'spawn' && b.kind === 'spawn') {
+    return sameCell(a.from, b.from) && sameCell(a.to, b.to);
+  }
+  if (a.kind === 'longshot' && b.kind === 'longshot') {
+    return sameCell(a.from, b.from) && sameCell(a.to, b.to);
+  }
+  if (a.kind === 'ride' && b.kind === 'ride') {
+    return sameCell(a.from, b.from) && sameCell(a.to, b.to);
+  }
+  if (a.kind === 'dismount' && b.kind === 'dismount') {
+    return sameCell(a.from, b.from) && sameCell(a.to, b.to) && a.promotion === b.promotion;
+  }
+  if (a.kind === 'pawnPush' && b.kind === 'pawnPush') {
+    return sameCell(a.from, b.from);
+  }
+  if (a.kind === 'shield' && b.kind === 'shield') {
+    return sameCell(a.from, b.from);
+  }
+  if (a.kind === 'unshield' && b.kind === 'unshield') {
     return sameCell(a.from, b.from);
   }
   if (a.kind === 'transform' && b.kind === 'transform') {
     return sameCell(a.from, b.from) && sameCell(a.to, b.to) && a.into === b.into;
   }
-  if ((a.kind === 'swap' || a.kind === 'convert' || a.kind === 'retreat') && a.kind === b.kind) {
-    return sameCell((a as { from: Cell }).from, (b as { from: Cell }).from) && sameCell((a as { to: Cell }).to, (b as { to: Cell }).to);
+  if (a.kind === 'retreat' && b.kind === 'retreat') {
+    return sameCell(a.from, b.from) && sameCell(a.to, b.to);
   }
-  if (a.kind === 'defense' && b.kind === 'defense') return a.block === b.block;
   return false;
-}
-
-function eqCell(a: Cell | undefined, b: Cell | undefined): boolean {
-  if (!a || !b) return a === b;
-  return sameCell(a, b);
 }
 
 export { cellKey, isLight };

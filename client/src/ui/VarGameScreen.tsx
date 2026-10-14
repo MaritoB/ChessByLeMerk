@@ -8,8 +8,8 @@ import {
   type Color,
   type PieceType,
 } from '../var/board';
-import type { VarSnapshot } from '../var/engine';
-import type { VarSession } from '../var/session';
+import { FACTORY_TURNS, KING_QUEEN_TURNS, SPAWN_TURNS, type VarSnapshot } from '../var/engine';
+import { varLabel, type VarSession } from '../var/session';
 import { BoardVar } from './BoardVar';
 import { RoomLink } from './RoomLink';
 import { SkillHelp } from './SkillHelp';
@@ -24,13 +24,6 @@ export interface VarGameScreenProps {
   onExit: () => void;
 }
 
-const ARROW_DIRS: { df: number; dr: number; glyph: string; label: string }[] = [
-  { df: -1, dr: 1, glyph: '\u2196', label: 'arriba-izq' },
-  { df: 1, dr: 1, glyph: '\u2197', label: 'arriba-der' },
-  { df: -1, dr: -1, glyph: '\u2199', label: 'abajo-izq' },
-  { df: 1, dr: -1, glyph: '\u2198', label: 'abajo-der' },
-];
-
 const PROMO: { value: PieceType; label: string }[] = [
   { value: 'q', label: '\u265B' },
   { value: 'r', label: '\u265C' },
@@ -42,16 +35,10 @@ function destOf(action: Action): Cell | null {
   switch (action.kind) {
     case 'move':
     case 'retreat':
-    case 'swap':
-    case 'convert':
     case 'ride':
-    case 'unshelter':
-    case 'transform':
-      return action.to;
+    case 'dismount':
     case 'shelter':
-      return action.target;
-    case 'arrow':
-      return action.mode === 'guided' ? action.target ?? null : null;
+      return action.to;
     default:
       return null;
   }
@@ -61,9 +48,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
   const [snap, setSnap] = useState<VarSnapshot>(() => session.engine.snapshot());
   const [selected, setSelected] = useState<Cell | null>(null);
   const [promo, setPromo] = useState<Action[] | null>(null);
-  const [pendingSkill, setPendingSkill] = useState<
-    { kind: 'mount'; mode: 'tower' | 'archer' } | { kind: 'enterRook'; choice: 'queen' | 'shelter' } | null
-  >(null);
+  const [pendingMode, setPendingMode] = useState<{ kind: 'longshot'; from: Cell } | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [menuCell, setMenuCell] = useState<Cell | null>(null);
   const [, force] = useState(0);
@@ -73,13 +58,17 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
 
   const engine = session.engine;
   const myTurn = session.myColor === 'all' || session.myColor === snap.turn;
-  const pending = snap.pendingDefense;
-  const iAmDefender =
-    session.myColor === 'all' || (pending ? pending.defenderColor === session.myColor : false);
-  const canPlay = !snap.result && myTurn && !pending && (!session.online || session.connected);
+  const canPlay = !snap.result && myTurn && (!session.online || session.connected);
 
   const moves = useMemo(() => (canPlay ? engine.legalMoves() : []), [engine, snap, canPlay]);
   const skills = useMemo(() => (canPlay ? engine.skillActions() : []), [engine, snap, canPlay]);
+
+  const viewerColor: Color = session.myColor === 'all' ? snap.turn : session.myColor;
+  const fogOn = session.config.fog;
+  const visible = useMemo(
+    () => (fogOn ? engine.vision(viewerColor) : null),
+    [engine, snap, fogOn, viewerColor],
+  );
 
   const actionsFromSelected = useMemo(() => {
     if (!selected) return [] as Action[];
@@ -88,52 +77,31 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     );
   }, [moves, skills, selected]);
 
-  const targets = useMemo(() => {
-    const out: Cell[] = [];
-    if (pendingSkill) {
-      for (const a of actionsFromSelected) {
-        if (pendingSkill.kind === 'mount' && a.kind === 'mount' && a.mode === pendingSkill.mode) {
-          if (!out.some((c) => sameCell(c, a.to))) out.push(a.to);
-        }
-        if (pendingSkill.kind === 'enterRook' && a.kind === 'enterRook' && a.choice === pendingSkill.choice) {
-          if (!out.some((c) => sameCell(c, a.to))) out.push(a.to);
-        }
-      }
-      return out;
-    }
-    for (const a of actionsFromSelected) {
-      const d = destOf(a);
-      if (d && !out.some((c) => sameCell(c, d))) out.push(d);
-    }
-    return out;
-  }, [actionsFromSelected, pendingSkill]);
-
-  const mountActions = useMemo(
-    () => actionsFromSelected.filter((a): a is Extract<Action, { kind: 'mount' }> => a.kind === 'mount'),
+  const longshotActions = useMemo(
+    () => actionsFromSelected.filter((a): a is Extract<Action, { kind: 'longshot' }> => a.kind === 'longshot'),
     [actionsFromSelected],
   );
-  const enterActions = useMemo(
-    () => actionsFromSelected.filter((a): a is Extract<Action, { kind: 'enterRook' }> => a.kind === 'enterRook'),
-    [actionsFromSelected],
-  );
-
-  const arrowDirs = useMemo(
-    () =>
-      actionsFromSelected
-        .filter((a): a is Extract<Action, { kind: 'arrow' }> => a.kind === 'arrow' && a.mode !== 'guided' && Boolean(a.dir))
-        .map((a) => ({ action: a, dir: a.dir! })),
-    [actionsFromSelected],
-  );
-
-  const swapAction = useMemo(
-    () => actionsFromSelected.find((a) => a.kind === 'swap') ?? null,
-    [actionsFromSelected],
-  );
-
   const transformActions = useMemo(
     () => actionsFromSelected.filter((a): a is Extract<Action, { kind: 'transform' }> => a.kind === 'transform'),
     [actionsFromSelected],
   );
+  const has = (kind: Action['kind']) => actionsFromSelected.some((a) => a.kind === kind);
+
+  const targets = useMemo(() => {
+    const out: Cell[] = [];
+    if (pendingMode) {
+      for (const a of actionsFromSelected) {
+        if (a.kind === 'longshot' && !out.some((c) => sameCell(c, a.to))) out.push(a.to);
+      }
+      return out;
+    }
+    for (const a of actionsFromSelected) {
+      if (a.kind === 'longshot') continue;
+      const d = destOf(a);
+      if (d && !out.some((c) => sameCell(c, d))) out.push(d);
+    }
+    return out;
+  }, [actionsFromSelected, pendingMode]);
 
   const checkCell = useMemo(() => {
     if (!snap.check) return null;
@@ -160,7 +128,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     if (ok) {
       setSelected(null);
       setPromo(null);
-      setPendingSkill(null);
+      setPendingMode(null);
       setAnnotations([]);
       setMenuCell(null);
     }
@@ -173,13 +141,13 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     const p = snap.board[cell.r][cell.f];
     if (!p || p.color !== snap.turn) return false;
     setSelected(cell);
-    setPendingSkill(null);
+    setPendingMode(null);
     setMenuCell(cell);
     return true;
   }
 
   function applyCandidates(candidates: Action[]): boolean {
-    if (candidates.some((a) => a.kind === 'move' && a.promotion)) {
+    if (candidates.some((a) => (a.kind === 'move' || a.kind === 'dismount') && a.promotion)) {
       setPromo(candidates);
       return false;
     }
@@ -190,14 +158,17 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     if (annotations.length) setAnnotations([]);
     setMenuCell(null);
     if (!canPlay) return;
+    if (pendingMode && selected) {
+      const casts = actionsFromSelected.filter((a) => a.kind === 'longshot' && sameCell(a.to, cell));
+      if (casts.length) {
+        submit(casts[0]);
+        return;
+      }
+      setPendingMode(null);
+    }
     if (selected) {
       const candidates = actionsFromSelected.filter((a) => {
-        if (pendingSkill) {
-          if (pendingSkill.kind === 'mount') {
-            return a.kind === 'mount' && a.mode === pendingSkill.mode && sameCell(a.to, cell);
-          }
-          return a.kind === 'enterRook' && a.choice === pendingSkill.choice && sameCell(a.to, cell);
-        }
+        if (a.kind === 'longshot') return false;
         const d = destOf(a);
         return d ? sameCell(d, cell) : false;
       });
@@ -211,11 +182,11 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
       // Pulsar la misma pieza ya seleccionada NO la deselecciona.
       if (selected && sameCell(selected, cell)) return;
       setSelected(p.color === snap.turn ? cell : null);
-      setPendingSkill(null);
+      setPendingMode(null);
       return;
     }
     setSelected(null);
-    setPendingSkill(null);
+    setPendingMode(null);
   }
 
   function dropMove(from: Cell, to: Cell) {
@@ -223,6 +194,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     const all = [...engine.legalMoves(), ...engine.skillActions()];
     const candidates = all.filter((a) => {
       if (!('from' in a)) return false;
+      if (a.kind === 'longshot') return false;
       if (!sameCell((a as { from: Cell }).from, from)) return false;
       const d = destOf(a);
       return d ? sameCell(d, to) : false;
@@ -233,7 +205,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     }
     const p = snap.board[to.r][to.f];
     setSelected(p && p.color === snap.turn ? to : null);
-    setPendingSkill(null);
+    setPendingMode(null);
   }
 
   function handleResign() {
@@ -248,6 +220,9 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
   const dangerKeys = showDanger ? snap.nextRing.map((c) => `${c.f},${c.r}`) : [];
   const dangerLevel = showDanger ? Math.min(3, Math.max(0, Math.floor(snap.shrinkProgress * 4))) : 0;
   const pliesToShrink = showDanger ? shrinkEvery - Math.round(snap.shrinkProgress * shrinkEvery) : 0;
+
+  const trainingCell =
+    snap.training && snap.training.target.f >= 0 ? cellKey(snap.training.target) : null;
 
   const clockTC =
     session.timeControl && (!session.online || session.connected)
@@ -283,142 +258,103 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     if (!selected) return null;
     const sel = snap.board[selected.r][selected.f];
     if (!sel) return null;
-    const usesLeft = sel.type === 'p' ? (sel.shield ? 1 : 0) : snap.skillsLeft[turnColor][sel.type];
+    const spawnActions = actionsFromSelected.filter(
+      (a): a is Extract<Action, { kind: 'spawn' }> => a.kind === 'spawn',
+    );
     return (
       <div className="skills">
-        <SkillHelp piece={sel.type} usesLeft={usesLeft} />
-        {arrowDirs.length > 0 && (
-          <>
-            <div className="muted small">
-              Flecha del alfil ({arrowDirs[0].action.kind === 'arrow' ? arrowDirs[0].action.mode : ''}):
-            </div>
-            <div className="skill-row">
-              {ARROW_DIRS.map((d) => {
-                const found = arrowDirs.find(
-                  (ad) => ad.dir.f === d.df && ad.dir.r === d.dr,
-                );
-                return (
-                  <button
-                    key={d.label}
-                    type="button"
-                    className="btn btn--ghost skill-dir"
-                    disabled={!found}
-                    onClick={() => found && submit(found.action)}
-                  >
-                    {d.glyph}
-                  </button>
-                );
-              })}
-            </div>
-          </>
-        )}
-        {arrowDirs.some((ad) => ad.action.kind === 'arrow' && ad.action.mode === 'guided') && (
-          <div className="muted small">
-            Flecha guiada: toca una casilla en diagonal (puede pasar por encima).
-          </div>
-        )}
-        {swapAction && (
-          <button type="button" className="btn btn--outline" onClick={() => submit(swapAction)}>
-            Permutar con la reina
+        <SkillHelp piece={sel.type} shieldActive={Boolean(sel.shield)} />
+        {has('shield') && (
+          <button type="button" className="btn btn--outline" onClick={() => submit(actionsFromSelected.find((a) => a.kind === 'shield')!)}>
+            Activar escudo (fijo; quien lo ataca muere)
           </button>
         )}
-        {actionsFromSelected.some((a) => a.kind === 'warcry') && (
+        {has('unshield') && (
+          <button type="button" className="btn btn--outline" onClick={() => submit(actionsFromSelected.find((a) => a.kind === 'unshield')!)}>
+            Quitar escudo (puede volver a moverse)
+          </button>
+        )}
+        {longshotActions.length > 0 && (
+          <button
+            type="button"
+            className={pendingMode?.kind === 'longshot' ? 'btn btn--primary' : 'btn btn--outline'}
+            onClick={() =>
+              setPendingMode(pendingMode?.kind === 'longshot' ? null : { kind: 'longshot', from: selected })
+            }
+          >
+            Longshot (1 turno; guarecido = instantáneo)
+          </button>
+        )}
+        {pendingMode?.kind === 'longshot' && (
+          <div className="muted small">Toca una casilla en diagonal para el longshot.</div>
+        )}
+        {has('retreat') && (
+          <div className="muted small">Retroceder: toca la casilla de atras.</div>
+        )}
+        {has('pawnPush') && (
           <button
             type="button"
             className="btn btn--outline"
-            onClick={() => {
-              const a = actionsFromSelected.find((x) => x.kind === 'warcry');
-              if (a) submit(a);
-            }}
+            onClick={() => submit(actionsFromSelected.find((a) => a.kind === 'pawnPush')!)}
           >
-            Grito de guerra (renueva skill a los aliados adyacentes)
+            Ariete (gratis): avanzan todos los peones doblados de la columna
           </button>
         )}
-        {transformActions.length > 0 && (
+        {spawnActions.length > 0 && (
           <div>
             <div className="muted small">
-              Reina guarecida en torre: transforma un peón adyacente (caballo; alfil si el peón no
-              tenía punto; torre si lo tenía):
+              Fábrica (reina guarecida): crea un peón nuevo en una casilla adyacente ({SPAWN_TURNS}{' '}
+              turnos; la torre debe quedarse quieta).
             </div>
             <div className="skill-row" style={{ flexWrap: 'wrap' }}>
-              {transformActions.map((a, i) => (
+              {spawnActions.map((a, i) => (
                 <button key={i} type="button" className="btn btn--outline" onClick={() => submit(a)}>
-                  {squareName(a.to)} {'\u2192'} {pieceName[a.into] ?? a.into}
+                  Peón en {squareName(a.to)} ({SPAWN_TURNS}t)
                 </button>
               ))}
             </div>
           </div>
         )}
-        {mountActions.length > 0 && (
+        {transformActions.length > 0 && (
           <div>
-            <div className="muted small">Montar en caballo (arquero):</div>
-            <div className="skill-row">
-              <button
-                type="button"
-                className={pendingSkill?.kind === 'mount' && pendingSkill.mode === 'tower' ? 'btn btn--primary' : 'btn btn--outline'}
-                onClick={() => setPendingSkill({ kind: 'mount', mode: 'tower' })}
-              >
-                Mueve caballo+torre
-              </button>
-              <button
-                type="button"
-                className={pendingSkill?.kind === 'mount' && pendingSkill.mode === 'archer' ? 'btn btn--primary' : 'btn btn--outline'}
-                onClick={() => setPendingSkill({ kind: 'mount', mode: 'archer' })}
-              >
-                Mueve caballo, captura alfil
-              </button>
+            <div className="muted small">
+              Transformar un peón adyacente en otra pieza (tarda turnos; una pieza de cada tipo por
+              bando). El rey solo puede hacer reinas; la reina guarecida, caballo/alfil/torre.
+            </div>
+            <div className="skill-row" style={{ flexWrap: 'wrap' }}>
+              {transformActions.map((a, i) => (
+                <button key={i} type="button" className="btn btn--outline" onClick={() => submit(a)}>
+                  {squareName(a.to)} {'\u2192'} {pieceName[a.into] ?? a.into} (
+                  {a.into === 'q' ? KING_QUEEN_TURNS : FACTORY_TURNS[a.into as 'n' | 'b' | 'r']}t)
+                </button>
+              ))}
             </div>
           </div>
         )}
-        {enterActions.length > 0 && (
-          <div>
-            <div className="muted small">Entrar en torre:</div>
-            <div className="skill-row">
-              <button
-                type="button"
-                className={pendingSkill?.kind === 'enterRook' && pendingSkill.choice === 'queen' ? 'btn btn--primary' : 'btn btn--outline'}
-                onClick={() => setPendingSkill({ kind: 'enterRook', choice: 'queen' })}
-              >
-                Convertirse en reina
-              </button>
-              <button
-                type="button"
-                className={pendingSkill?.kind === 'enterRook' && pendingSkill.choice === 'shelter' ? 'btn btn--primary' : 'btn btn--outline'}
-                onClick={() => setPendingSkill({ kind: 'enterRook', choice: 'shelter' })}
-              >
-                Guarecerse (dispara dentro)
-              </button>
-            </div>
-          </div>
-        )}
-        {pendingSkill && (
+        {snap.training && snap.training.color === turnColor && (
           <div className="muted small">
-            Toca {pendingSkill.kind === 'mount' ? 'el caballo' : 'la torre'} objetivo.
+            Entrenando {pieceName[snap.training.into] ?? snap.training.into}: faltan {snap.training.turnsLeft}{' '}
+            turno{snap.training.turnsLeft === 1 ? '' : 's'}.
           </div>
         )}
-        {actionsFromSelected.some((a) => a.kind === 'convert') && (
-          <div className="muted small">Conversion: toca una pieza enemiga marcada.</div>
+        {has('unshelter') && (
+          <div>
+            <div className="muted small">Desguarecer (suelta la pieza guarecida a una casilla adyacente):</div>
+            <div className="skill-row" style={{ flexWrap: 'wrap' }}>
+              {actionsFromSelected
+                .filter((a): a is Extract<Action, { kind: 'unshelter' }> => a.kind === 'unshelter')
+                .map((a, i) => (
+                  <button key={i} type="button" className="btn btn--outline" onClick={() => submit(a)}>
+                    Suelta en {squareName(a.to)}
+                  </button>
+                ))}
+            </div>
+          </div>
         )}
-        {actionsFromSelected.some((a) => a.kind === 'shelter') && (
-          <div className="muted small">Guarecer: toca una pieza aliada adyacente.</div>
-        )}
-        {actionsFromSelected.some((a) => a.kind === 'retreat') && (
-          <div className="muted small">Retroceder: toca la casilla trasera (pierde armadura).</div>
-        )}
-        {actionsFromSelected.some((a) => a.kind === 'ride') && (
-          <div className="muted small">Montar: toca el caballo aliado adyacente (pierdes armadura).</div>
-        )}
-        {actionsFromSelected.some((a) => a.kind === 'pawnPush') && (
-          <button
-            type="button"
-            className="btn btn--outline"
-            onClick={() => {
-              const a = actionsFromSelected.find((x) => x.kind === 'pawnPush');
-              if (a) submit(a);
-            }}
-          >
-            Empujón: avanzan todos los peones de la columna (mata lo que haya delante)
-          </button>
+        {has('ride') && <div className="muted small">Montar: toca el caballo aliado adyacente.</div>}
+        {has('dismount') && <div className="muted small">Desmontar: toca una casilla libre adyacente.</div>}
+        {has('shelter') && (
+          <div className="muted small">Guarecer: toca tu torre (o arrastra la pieza sobre ella).</div>
         )}
       </div>
     );
@@ -428,11 +364,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     <div className="game">
       <header className="topbar">
         <div className="topbar__left">
-          <span className="chip chip--mode">
-            {session.config.modeId === 'royale'
-              ? '\u{1F451} Royale'
-              : '\u2728 Ajedrez con Skills'}
-          </span>
+          <span className="chip chip--mode">{'\u2728'} {varLabel(session.config)}</span>
           {session.config.shrinkEvery > 0 && (
             <span className="chip">Encoge cada {session.config.shrinkEvery} jugadas</span>
           )}
@@ -478,15 +410,10 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
             onCell={handleCell}
             disabled={!canPlay}
             checkCell={checkCell}
-            isDraggable={(c) =>
-              canPlay &&
-              !pendingSkill &&
-              !snap.board[c.r][c.f]?.cargo &&
-              snap.board[c.r][c.f]?.color === snap.turn
-            }
+            isDraggable={(c) => canPlay && !pendingMode && snap.board[c.r][c.f]?.color === snap.turn}
             onDragStart={(c) => {
               setSelected(c);
-              setPendingSkill(null);
+              setPendingMode(null);
             }}
             onDropMove={dropMove}
             onSkillMenu={openSkillMenu}
@@ -494,31 +421,10 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
             onAnnotate={(a) => setAnnotations((prev) => toggleAnnotation(prev, a))}
             dangerKeys={dangerKeys}
             dangerLevel={dangerLevel}
+            trainingCell={trainingCell}
+            visible={visible}
+            fog={fogOn}
           />
-
-          {pending && (
-            <div className="decision">
-              {iAmDefender ? (
-                <>
-                  <span>
-                    {pending.isRookBreak
-                      ? 'Atacan tu torre con una pieza dentro. ¿Quieres bloquear?'
-                      : 'Atacan a tu peón. Usar armadura (la pieza atacante vuelve) o dejarlo morir.'}
-                  </span>
-                  <div className="decision__actions">
-                    <button type="button" className="btn btn--primary" onClick={() => submit({ kind: 'defense', block: true })}>
-                      Bloquear
-                    </button>
-                    <button type="button" className="btn btn--ghost" onClick={() => submit({ kind: 'defense', block: false })}>
-                      No bloquear
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <span>Esperando la decision del rival...</span>
-              )}
-            </div>
-          )}
 
           {snap.result && (
             <div className="result-overlay">
@@ -547,7 +453,9 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
                       type="button"
                       className="btn btn--ghost promo-btn"
                       onClick={() => {
-                        const chosen = promo.find((a) => a.kind === 'move' && a.promotion === p.value);
+                        const chosen = promo.find(
+                          (a) => (a.kind === 'move' || a.kind === 'dismount') && a.promotion === p.value,
+                        );
                         if (chosen) submit(chosen);
                       }}
                     >
@@ -613,12 +521,12 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
               ) : (
                 <div className="muted small">Selecciona una pieza para ver sus habilidades.</div>
               )}
-              <div className="skill-counts">
-                {turnColor === 'w' ? 'Blancas' : 'Negras'}:{' '}
-                {(['p', 'n', 'b', 'r', 'q', 'k'] as PieceType[])
-                  .map((t) => `${pieceName[t] ?? t} ${snap.skillsLeft[turnColor][t]}`)
-                  .join(' · ')}
-              </div>
+              {(snap.transformed.w.length > 0 || snap.transformed.b.length > 0) && (
+                <div className="muted small">
+                  Fabricadas — blancas: {snap.transformed.w.join(', ') || '—'} · negras:{' '}
+                  {snap.transformed.b.join(', ') || '—'}
+                </div>
+              )}
             </div>
           )}
 
@@ -673,6 +581,3 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     </div>
   );
 }
-
-void cellKey;
-void squareName;

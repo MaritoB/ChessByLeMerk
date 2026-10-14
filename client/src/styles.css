@@ -1000,6 +1000,32 @@ h3 {
   top: 2%;
   text-shadow: 0 0 0.6cqw rgba(0, 0, 0, 0.8);
 }
+.sqv--training::before {
+  content: '';
+  position: absolute;
+  inset: 4%;
+  border-radius: 50%;
+  border: 0.6cqw dashed rgba(120, 200, 255, 0.95);
+  box-shadow: 0 0 1cqw rgba(120, 200, 255, 0.5);
+  pointer-events: none;
+  z-index: 3;
+  animation: training-pulse 1.2s ease-in-out infinite;
+}
+@keyframes training-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.bv--fog .sqv--hidden {
+  background: #0b0e14 !important;
+}
+.sqv--hidden {
+  cursor: default;
+}
 .bv--disabled .sqv {
   cursor: default;
 }

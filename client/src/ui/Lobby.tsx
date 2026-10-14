@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Socket } from 'socket.io-client';
 import type { GameModeId, RoomInfo } from '@shared/protocol';
-import { MODE_LIST, fourFormatOf, isFourMode, isVarMode, varConfigOf, varModeIdOf } from '../modes';
+import { MODE_LIST, fourFormatOf, isFourMode, isVarMode, varConfigFrom, varConfigOf, varModeIdOf, type VarMods } from '../modes';
 import { OnlineGame } from '../net/OnlineGame';
 import { FourGame } from '../net/FourGame';
 import { VarGame } from '../net/VarGame';
@@ -22,7 +22,7 @@ export interface LobbyProps {
   serverUrl: string;
   setServerUrl: (url: string) => void;
   rooms: RoomInfo[];
-  onStartLocal: (modeId: GameModeId) => void;
+  onStartLocal: (modeId: GameModeId, mods?: VarMods) => void;
   onStartSandbox: (modeId: GameModeId) => void;
   onEnterOnline: (conn: OnlineConn) => void;
   initialRoom?: string | null;
@@ -48,6 +48,7 @@ export function Lobby({
   timeControl,
 }: LobbyProps) {
   const [selectedMode, setSelectedMode] = useState<GameModeId>('standard');
+  const [mods, setMods] = useState<VarMods>({ skills: true, shrink: false, fog: false });
   const [roomName, setRoomName] = useState('');
   const [isPrivate, setIsPrivate] = useState(false);
   const [password, setPassword] = useState('');
@@ -67,6 +68,11 @@ export function Lobby({
   }, [initialRoom, socket, connected, rooms]);
 
   const name = playerName.trim() || 'Jugador';
+
+  useEffect(() => {
+    if (selectedMode === 'skills') setMods({ skills: true, shrink: false, fog: false });
+    else if (selectedMode === 'royale') setMods({ skills: false, shrink: true, fog: false });
+  }, [selectedMode]);
 
   async function handleCreate() {
     if (!socket) return;
@@ -100,7 +106,7 @@ export function Lobby({
                 socket,
                 role: 'host',
                 roomId: res.roomId,
-                config: varConfigOf(varModeIdOf(selectedMode)),
+                config: varConfigFrom(varModeIdOf(selectedMode), mods),
                 playerName: name,
                 timeControl,
               }),
@@ -248,8 +254,43 @@ export function Lobby({
             {MODE_LIST.find((m) => m.id === selectedMode)?.description}
           </p>
 
+          {isVarMode(selectedMode) && (
+            <div className="mods">
+              <span className="muted small">Combinar modificadores (2 jugadores):</span>
+              <div className="row">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={mods.skills}
+                    onChange={(e) => setMods((m) => ({ ...m, skills: e.target.checked }))}
+                  />
+                  Skills
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={mods.shrink}
+                    onChange={(e) => setMods((m) => ({ ...m, shrink: e.target.checked }))}
+                  />
+                  Encogimiento (Royale)
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={mods.fog}
+                    onChange={(e) => setMods((m) => ({ ...m, fog: e.target.checked }))}
+                  />
+                  Niebla (Fog)
+                </label>
+              </div>
+              <p className="muted small">
+                Podés combinar Skills, Royale (tablero que encoge) y Niebla en la misma partida.
+              </p>
+            </div>
+          )}
+
           <div className="row">
-            <button type="button" className="btn btn--primary" onClick={() => onStartLocal(selectedMode)}>
+            <button type="button" className="btn btn--primary" onClick={() => onStartLocal(selectedMode, mods)}>
               {isVarMode(selectedMode) || isFourMode(selectedMode)
                 ? '\u25B6 Practicar solo (sin rival)'
                 : 'Partida local (mismo dispositivo)'}
@@ -271,7 +312,7 @@ export function Lobby({
           <button
             type="button"
             className="btn btn--outline"
-            onClick={() => onStartLocal(selectedMode)}
+            onClick={() => onStartLocal(selectedMode, mods)}
           >
             {'\u25B6 Practicar solo sin rival'} ({MODE_LIST.find((m) => m.id === selectedMode)?.name})
           </button>
