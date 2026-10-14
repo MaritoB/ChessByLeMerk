@@ -49,6 +49,27 @@ export interface PeerInfo {
   id: string;
   name: string;
   isHost: boolean;
+  /** false si el jugador se desconecto y esta dentro del periodo de gracia. */
+  connected?: boolean;
+}
+
+/** Identidad estable de un jugador en una sala (para reconectar). */
+export interface SessionIdentity {
+  playerId: string;
+  secret: string;
+}
+
+export interface RejoinPayload {
+  roomId: string;
+  playerId: string;
+  secret: string;
+}
+
+/** Eventos de presencia de jugadores (reconexion). */
+export interface PeerPresenceEvent {
+  peerId: string;
+  name?: string;
+  isHost?: boolean;
 }
 
 // -------- Senalizacion WebRTC --------

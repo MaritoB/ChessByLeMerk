@@ -6,6 +6,7 @@ import type { GameMode } from '../modes/types';
 import { GameController, type MoveResult } from '../game/GameController';
 import type { TimeControl } from '../game/clock';
 import { PeerSession } from './peer';
+import { clearSession } from './identity';
 
 export type OnlinePhase = 'connecting' | 'waiting' | 'playing' | 'closed' | 'error';
 
@@ -35,14 +36,27 @@ export interface OnlineGameOptions {
   playerName: string;
   opponentName: string;
   opponentId?: string;
+  playerId: string;
+  secret: string;
   timeControl?: { initial: number; increment: number };
 }
 
 type Listener = (snapshot: OnlineSnapshot) => void;
 
+interface ResyncMsg {
+  type: 'resync';
+  moves: { from: string; to: string; promotion?: string }[];
+  result?: { winner: Color | 'draw' | null; reason: string } | null;
+  lives?: Record<Color, number>;
+  timeControl?: TimeControl;
+}
+
+type Inbound = NetMessage | ResyncMsg;
+
 /**
  * Orquesta una partida online: crea la conexion WebRTC, intercambia el
  * mensaje de inicio, y conecta las jugadas con el GameController.
+ * Soporta reconexion (identidad estable + resync del estado).
  */
 export class OnlineGame {
   readonly mode: GameMode;
@@ -52,10 +66,13 @@ export class OnlineGame {
   private readonly socket: Socket;
   private readonly role: 'host' | 'guest';
   private readonly playerName: string;
+  private readonly myPlayerId: string;
+  private readonly secret: string;
   private peer: PeerSession | null = null;
   private remotePeerId: string | null = null;
   private pendingSignals: RtcSignal[] = [];
   private started = false;
+  private left = false;
   private chat: ChatEntry[] = [];
   private timeControlValue: TimeControl;
   private snapshotData: OnlineSnapshot;
@@ -68,6 +85,8 @@ export class OnlineGame {
     this.mode = getMode(options.modeId);
     this.controller = new GameController(this.mode);
     this.playerName = options.playerName;
+    this.myPlayerId = options.playerId;
+    this.secret = options.secret;
     this.remotePeerId = options.opponentId ?? null;
     this.timeControlValue = options.timeControl ?? { initial: 0, increment: 0 };
     this.snapshotData = {
@@ -86,6 +105,9 @@ export class OnlineGame {
     this.socket.on('rtc:hello', this.onRtcHello);
     this.socket.on('room:peer-joined', this.onPeerJoined);
     this.socket.on('room:peer-left', this.onPeerLeft);
+    this.socket.on('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.on('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.on('connect', this.onSocketConnect);
 
     if (options.role === 'guest' && options.opponentId) {
       this.createPeer(false);
@@ -129,20 +151,38 @@ export class OnlineGame {
 
   private createPeer(initiator: boolean): void {
     if (this.peer) return;
-    this.peer = new PeerSession(
+    let peer!: PeerSession;
+    peer = new PeerSession(
       initiator,
       {
-        onOpen: () => this.onDataChannelOpen(),
-        onMessage: (msg) => this.onMessage(msg),
-        onClose: () => this.onPeerClose(),
-        onStateChange: (state) => this.patch({ connectionState: state }),
+        onOpen: () => {
+          if (this.peer === peer) this.onDataChannelOpen();
+        },
+        onMessage: (msg) => {
+          if (this.peer === peer) this.onMessage(msg);
+        },
+        onClose: () => {
+          if (this.peer === peer) this.onPeerClose();
+        },
+        onStateChange: (state) => {
+          if (this.peer === peer) this.patch({ connectionState: state });
+        },
       },
-      (data) => this.sendSignal(data),
+      (data) => {
+        if (this.peer === peer) this.sendSignal(data);
+      },
     );
+    this.peer = peer;
     const buffered = this.pendingSignals;
     this.pendingSignals = [];
-    for (const signal of buffered) void this.peer.handleSignal(signal);
-    if (initiator) void this.peer.createOffer();
+    for (const signal of buffered) void peer.handleSignal(signal);
+    if (initiator) void peer.createOffer();
+  }
+
+  private closePeer(): void {
+    this.peer?.close();
+    this.peer = null;
+    this.pendingSignals = [];
   }
 
   private sendSignal(data: RtcSignal): void {
@@ -156,10 +196,13 @@ export class OnlineGame {
   private onRtcSignal = (payload: { from: string; data: RtcSignal }): void => {
     this.remotePeerId = payload.from;
     if (!this.peer) {
-      this.pendingSignals.push(payload.data);
-      return;
+      if (this.role === 'guest') this.createPeer(false);
+      else {
+        this.pendingSignals.push(payload.data);
+        return;
+      }
     }
-    void this.peer.handleSignal(payload.data);
+    void this.peer?.handleSignal(payload.data);
   };
 
   private onPeerJoined = (payload: { peer: { id: string; name: string } }): void => {
@@ -173,25 +216,88 @@ export class OnlineGame {
   };
 
   private onPeerLeft = (): void => {
-    this.peer?.close();
-    this.peer = null;
+    this.closePeer();
     this.patch({ phase: 'closed', connected: false, error: 'El rival se ha desconectado' });
   };
 
+  private onPeerDisconnected = (): void => {
+    if (!this.started) return;
+    this.patch({ connected: false, phase: 'connecting', error: 'Rival desconectado, esperando...' });
+  };
+
+  private onPeerReconnected = (): void => {
+    this.resetAndReconnect();
+    this.patch({ error: null, phase: this.started ? 'connecting' : this.snapshotData.phase });
+  };
+
+  private onSocketConnect = (): void => {
+    if (this.left || this.snapshotData.phase === 'closed') return;
+    this.rejoin();
+  };
+
+  /** Reintenta entrar en la sala tras una reconexion del socket. */
+  private rejoin(): void {
+    this.socket.emit(
+      'rooms:rejoin',
+      { roomId: this.roomId, playerId: this.myPlayerId, secret: this.secret },
+      (res: { ok: boolean; data?: { host: { id: string }; players: { id: string }[] }; error?: string }) => {
+        if (!res.ok) {
+          this.patch({ phase: 'error', error: res.error ?? 'No se pudo reconectar' });
+          return;
+        }
+        if (this.role === 'guest' && res.data?.host) {
+          this.remotePeerId = res.data.host.id;
+        } else if (this.role === 'host' && res.data?.players) {
+          const other = res.data.players.find((p) => p.id !== this.myPlayerId);
+          if (other) this.remotePeerId = other.id;
+        }
+        this.resetAndReconnect();
+        this.patch({ error: null, phase: this.started ? 'connecting' : this.snapshotData.phase });
+      },
+    );
+  }
+
+  /** Cierra la conexion actual y vuelve a negociar (reconexion). */
+  private resetAndReconnect(): void {
+    this.closePeer();
+    if (this.role === 'host') {
+      this.createPeer(true);
+    } else {
+      this.createPeer(false);
+      if (this.remotePeerId) this.socket.emit('rtc:hello', { to: this.remotePeerId });
+    }
+  }
+
   private onPeerClose = (): void => {
-    if (this.snapshotData.phase === 'closed') return;
-    this.patch({ connected: false, phase: 'closed', error: 'Conexion P2P cerrada' });
+    if (this.snapshotData.phase === 'closed' || this.left) return;
+    this.patch({ connected: false, connectionState: 'disconnected' });
   };
 
   private onDataChannelOpen = (): void => {
-    if (this.role === 'host' && !this.started) {
-      const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
-      const start: StartMsg = { type: 'start', mode: this.mode.id, white, timeControl: this.timeControlValue };
-      this.peer?.send(start);
-      this.beginGame(white);
+    if (this.role === 'host') {
+      if (!this.started) {
+        const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
+        const start: StartMsg = { type: 'start', mode: this.mode.id, white, timeControl: this.timeControlValue };
+        this.peer?.send(start);
+        this.beginGame(white);
+      } else {
+        this.sendResync();
+      }
     }
-    this.patch({ connected: true });
+    this.patch({ connected: true, phase: this.started ? 'playing' : this.snapshotData.phase });
   };
+
+  private sendResync(): void {
+    const snap = this.controller.snapshot();
+    const resync: ResyncMsg = {
+      type: 'resync',
+      moves: snap.history.map((h) => ({ from: h.from, to: h.to, promotion: h.promotion })),
+      result: snap.result,
+      lives: snap.lives,
+      timeControl: this.timeControlValue,
+    };
+    this.peer?.send(resync);
+  }
 
   private beginGame(whiteRole: 'host' | 'guest'): void {
     if (this.started) return;
@@ -201,11 +307,17 @@ export class OnlineGame {
     this.pushChat('system', 'Partida iniciada. Juegas con las ' + (myColor === 'w' ? 'blancas' : 'negras'));
   }
 
-  private onMessage(msg: NetMessage): void {
+  private onMessage(msg: Inbound): void {
     switch (msg.type) {
       case 'start':
         if (msg.timeControl) this.timeControlValue = msg.timeControl;
         this.beginGame(msg.white);
+        break;
+      case 'resync':
+        if (msg.timeControl) this.timeControlValue = msg.timeControl;
+        this.controller.sync({ moves: msg.moves, result: msg.result, lives: msg.lives });
+        this.started = true;
+        this.patch({ connected: true, phase: 'playing' });
         break;
       case 'move':
         this.controller.applyRemote({ from: msg.from, to: msg.to, promotion: msg.promotion });
@@ -288,13 +400,17 @@ export class OnlineGame {
   }
 
   leave(): void {
+    this.left = true;
+    clearSession(this.roomId);
     this.socket.emit('rooms:leave');
     this.socket.off('rtc:signal', this.onRtcSignal);
     this.socket.off('rtc:hello', this.onRtcHello);
     this.socket.off('room:peer-joined', this.onPeerJoined);
     this.socket.off('room:peer-left', this.onPeerLeft);
-    this.peer?.close();
-    this.peer = null;
+    this.socket.off('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.off('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.off('connect', this.onSocketConnect);
+    this.closePeer();
     this.controller.dispose();
     this.patch({ phase: 'closed' });
   }

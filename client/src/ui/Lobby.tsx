@@ -5,9 +5,11 @@ import { MODE_LIST, fourFormatOf, isFourMode, isVarMode, varConfigFrom, varConfi
 import { OnlineGame } from '../net/OnlineGame';
 import { FourGame } from '../net/FourGame';
 import { VarGame } from '../net/VarGame';
-import { createRoom, joinRoom } from '../net/lobby';
+import { createRoom, joinRoom, rejoinRoom } from '../net/lobby';
+import { clearSession, loadSession, saveSession, type StoredSession } from '../net/identity';
 import { setPieceStyle, usePieceStyle } from './theme';
 import { TIME_CONTROLS, type TimeControl } from '../game/clock';
+import type { VarConfig } from '../var/session';
 
 export type OnlineConn =
   | { kind: 'two'; game: OnlineGame }
@@ -62,6 +64,11 @@ export function Lobby({
   useEffect(() => {
     if (!initialRoom || autoJoined.current || !socket || !connected) return;
     autoJoined.current = true;
+    const stored = loadSession(initialRoom);
+    if (stored) {
+      void handleRejoin(initialRoom, stored);
+      return;
+    }
     const info = rooms.find((r) => r.id === initialRoom);
     void handleJoin(initialRoom, info?.hasPassword ?? false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -74,10 +81,75 @@ export function Lobby({
     else if (selectedMode === 'royale') setMods({ skills: false, shrink: true, fog: false });
   }, [selectedMode]);
 
+  function buildConn(opts: {
+    mode: GameModeId;
+    role: 'host' | 'guest';
+    roomId: string;
+    playerId: string;
+    secret: string;
+    config?: VarConfig;
+    format?: 'ffa' | 'teams';
+    opponentId?: string;
+    opponentName?: string;
+  }): OnlineConn | null {
+    if (!socket) return null;
+    const isHost = opts.role === 'host';
+    if (isFourMode(opts.mode)) {
+      return {
+        kind: 'four',
+        game: new FourGame({
+          socket,
+          role: opts.role,
+          roomId: opts.roomId,
+          format: opts.format ?? fourFormatOf(opts.mode),
+          playerName: name,
+          playerId: opts.playerId,
+          secret: opts.secret,
+          hostId: opts.opponentId,
+          hostName: opts.opponentName,
+          timeControl: isHost ? timeControl : undefined,
+        }),
+      };
+    }
+    if (isVarMode(opts.mode)) {
+      return {
+        kind: 'var',
+        game: new VarGame({
+          socket,
+          role: opts.role,
+          roomId: opts.roomId,
+          config: opts.config ?? varConfigOf(varModeIdOf(opts.mode)),
+          playerName: name,
+          playerId: opts.playerId,
+          secret: opts.secret,
+          opponentId: opts.opponentId,
+          opponentName: opts.opponentName,
+          timeControl: isHost ? timeControl : undefined,
+        }),
+      };
+    }
+    return {
+      kind: 'two',
+      game: new OnlineGame({
+        socket,
+        role: opts.role,
+        roomId: opts.roomId,
+        modeId: opts.mode,
+        playerName: name,
+        playerId: opts.playerId,
+        secret: opts.secret,
+        opponentName: opts.opponentName ?? 'Esperando rival...',
+        opponentId: opts.opponentId,
+        timeControl: isHost ? timeControl : undefined,
+      }),
+    };
+  }
+
   async function handleCreate() {
     if (!socket) return;
     setBusy(true);
     setError(null);
+    const config = isVarMode(selectedMode) ? varConfigFrom(varModeIdOf(selectedMode), mods) : undefined;
     const res = await createRoom(socket, {
       name: roomName.trim() || `Sala de ${name}`,
       hostName: name,
@@ -86,44 +158,24 @@ export function Lobby({
       password: password.trim() || undefined,
     });
     setBusy(false);
-    if (res.ok && res.roomId) {
-      const conn: OnlineConn = isFourMode(selectedMode)
-        ? {
-            kind: 'four',
-            game: new FourGame({
-              socket,
-              role: 'host',
-              roomId: res.roomId,
-              format: fourFormatOf(selectedMode),
-              playerName: name,
-              timeControl,
-            }),
-          }
-        : isVarMode(selectedMode)
-          ? {
-              kind: 'var',
-              game: new VarGame({
-                socket,
-                role: 'host',
-                roomId: res.roomId,
-                config: varConfigFrom(varModeIdOf(selectedMode), mods),
-                playerName: name,
-                timeControl,
-              }),
-            }
-          : {
-              kind: 'two',
-              game: new OnlineGame({
-                socket,
-                role: 'host',
-                roomId: res.roomId,
-                modeId: selectedMode,
-                playerName: name,
-                opponentName: 'Esperando rival...',
-                timeControl,
-              }),
-            };
-      onEnterOnline(conn);
+    if (res.ok && res.roomId && res.playerId && res.secret) {
+      saveSession(res.roomId, {
+        mode: selectedMode,
+        role: 'host',
+        playerId: res.playerId,
+        secret: res.secret,
+        config,
+        format: isFourMode(selectedMode) ? fourFormatOf(selectedMode) : undefined,
+      });
+      const conn = buildConn({
+        mode: selectedMode,
+        role: 'host',
+        roomId: res.roomId,
+        playerId: res.playerId,
+        secret: res.secret,
+        config,
+      });
+      if (conn) onEnterOnline(conn);
     } else {
       setError(res.error ?? 'No se pudo crear la sala');
     }
@@ -139,49 +191,59 @@ export function Lobby({
     setError(null);
     const res = await joinRoom(socket, { roomId, playerName: name, password: pw });
     setBusy(false);
-    if (res.ok && res.roomId && res.host) {
+    if (res.ok && res.roomId && res.host && res.playerId && res.secret) {
       const modeId = res.mode ?? 'standard';
-      const conn: OnlineConn = isFourMode(modeId)
-        ? {
-            kind: 'four',
-            game: new FourGame({
-              socket,
-              role: 'guest',
-              roomId: res.roomId,
-              format: fourFormatOf(modeId),
-              playerName: name,
-              hostId: res.host.id,
-              hostName: res.host.name,
-            }),
-          }
-        : isVarMode(modeId)
-          ? {
-              kind: 'var',
-              game: new VarGame({
-                socket,
-                role: 'guest',
-                roomId: res.roomId,
-                config: varConfigOf(varModeIdOf(modeId)),
-                playerName: name,
-                opponentId: res.host.id,
-                opponentName: res.host.name,
-              }),
-            }
-          : {
-              kind: 'two',
-              game: new OnlineGame({
-                socket,
-                role: 'guest',
-                roomId: res.roomId,
-                modeId,
-                playerName: name,
-                opponentName: res.host.name,
-                opponentId: res.host.id,
-              }),
-            };
-      onEnterOnline(conn);
+      saveSession(res.roomId, {
+        mode: modeId,
+        role: 'guest',
+        playerId: res.playerId,
+        secret: res.secret,
+        format: isFourMode(modeId) ? fourFormatOf(modeId) : undefined,
+      });
+      const conn = buildConn({
+        mode: modeId,
+        role: 'guest',
+        roomId: res.roomId,
+        playerId: res.playerId,
+        secret: res.secret,
+        opponentId: res.host.id,
+        opponentName: res.host.name,
+      });
+      if (conn) onEnterOnline(conn);
     } else {
       setError(res.error ?? 'No se pudo entrar en la sala');
+    }
+  }
+
+  /** Reconecta a una sala tras recargar la pagina (identidad guardada). */
+  async function handleRejoin(roomId: string, stored: StoredSession) {
+    if (!socket) return;
+    setBusy(true);
+    setError(null);
+    const res = await rejoinRoom(socket, {
+      roomId,
+      playerId: stored.playerId,
+      secret: stored.secret,
+    });
+    setBusy(false);
+    if (res.ok) {
+      const modeId = res.mode ?? stored.mode;
+      const conn = buildConn({
+        mode: modeId,
+        role: stored.role,
+        roomId,
+        playerId: stored.playerId,
+        secret: stored.secret,
+        config: stored.config as VarConfig | undefined,
+        format: stored.format,
+        opponentId: stored.role === 'guest' ? res.host?.id : undefined,
+        opponentName: stored.role === 'guest' ? res.host?.name : undefined,
+      });
+      if (conn) onEnterOnline(conn);
+    } else {
+      clearSession(roomId);
+      const info = rooms.find((r) => r.id === roomId);
+      void handleJoin(roomId, info?.hasPassword ?? false);
     }
   }
 
@@ -430,7 +492,7 @@ export function Lobby({
                       type="button"
                       className="btn btn--primary btn--small"
                       onClick={() => handleJoin(room.id, room.hasPassword)}
-                      disabled={!connected || busy || room.playerCount >= room.maxPlayers || room.status === 'playing'}
+                      disabled={!connected || busy || room.playerCount >= room.maxPlayers}
                     >
                       {room.playerCount >= room.maxPlayers ? 'Llena' : 'Unirse'}
                     </button>

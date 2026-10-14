@@ -213,6 +213,11 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
     if (window.confirm('¿Abandonar la partida?')) session.resign();
   }
 
+  function handleLeave() {
+    session.leave();
+    onExit();
+  }
+
   const turnColor = snap.turn;
 
   const shrinkEvery = session.config.shrinkEvery;
@@ -374,7 +379,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
         </div>
         <div className="topbar__right">
           <span className="chip">{session.statusText}</span>
-          <button type="button" className="btn btn--ghost" onClick={onExit}>
+          <button type="button" className="btn btn--ghost" onClick={handleLeave}>
             Salir
           </button>
         </div>
@@ -434,7 +439,7 @@ export function VarGameScreen({ session, onExit }: VarGameScreenProps) {
                   <button type="button" className="btn btn--primary" onClick={() => session.rematch()}>
                     Revancha
                   </button>
-                  <button type="button" className="btn btn--ghost" onClick={onExit}>
+                  <button type="button" className="btn btn--ghost" onClick={handleLeave}>
                     Salir
                   </button>
                 </div>

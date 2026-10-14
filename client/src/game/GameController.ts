@@ -244,6 +244,30 @@ export class GameController {
     this.emit();
   }
 
+  /** Reconstruye el estado tras una reconexion (replay de jugadas). */
+  sync(payload: {
+    moves: { from: string; to: string; promotion?: string }[];
+    result?: { winner: Color | 'draw' | null; reason: string } | null;
+    lives?: Record<Color, number>;
+  }): void {
+    if (this.revealTimer) clearTimeout(this.revealTimer);
+    this.revealTimer = null;
+    this.reveal = null;
+    this.chess = new Chess();
+    for (const move of payload.moves) {
+      try {
+        this.chess.move({ from: move.from, to: move.to, promotion: move.promotion });
+      } catch {
+        /* jugada no reproducible: se ignora */
+      }
+    }
+    if (payload.lives) this.lives = { ...payload.lives };
+    this.result = null;
+    this.afterMove();
+    if (!this.result && payload.result) this.result = payload.result;
+    this.emit();
+  }
+
   dispose(): void {
     if (this.revealTimer) clearTimeout(this.revealTimer);
     this.listeners.clear();

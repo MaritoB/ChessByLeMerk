@@ -5,11 +5,13 @@ import { FourChess } from '../four/engine';
 import type { FourPhase, FourSession, SeatNames } from '../four/session';
 import type { TimeControl } from '../game/clock';
 import { PeerSession } from './peer';
+import { clearSession } from './identity';
 
 interface PlayerLite {
   id: string;
   name: string;
   isHost: boolean;
+  connected?: boolean;
 }
 
 interface NetStart {
@@ -32,7 +34,13 @@ interface NetRematch {
 interface NetAbort {
   t: 'abort';
 }
-type FourNetMsg = NetStart | NetMove | NetResign | NetRematch | NetAbort;
+interface NetResync {
+  t: 'resync';
+  seats: Partial<Record<Seat, string>>;
+  moves: FMove[];
+  timeControl?: TimeControl;
+}
+type FourNetMsg = NetStart | NetMove | NetResign | NetRematch | NetAbort | NetResync;
 
 export interface FourGameOptions {
   socket: Socket;
@@ -40,6 +48,8 @@ export interface FourGameOptions {
   roomId: string;
   format: GameFormat;
   playerName: string;
+  playerId: string;
+  secret: string;
   hostId?: string;
   hostName?: string;
   timeControl?: TimeControl;
@@ -50,6 +60,7 @@ const PLAYER_TARGET = 4;
 /**
  * Sala de 4 jugadores con topologia en estrella: todos los invitados se
  * conectan al anfitrion, que reenvia los mensajes al resto.
+ * Soporta reconexion (identidad estable + resync del estado).
  */
 export class FourGame implements FourSession {
   readonly engine: FourChess;
@@ -59,6 +70,8 @@ export class FourGame implements FourSession {
   private readonly socket: Socket;
   private readonly role: 'host' | 'guest';
   readonly roomId: string;
+  private readonly myPlayerId: string;
+  private readonly secret: string;
   private hostId: string | null;
   private hostName: string;
 
@@ -67,6 +80,7 @@ export class FourGame implements FourSession {
   private mySeatValue: Seat | null = null;
   private phaseValue: FourPhase = 'waiting';
   private started = false;
+  private left = false;
   private error: string | null = null;
   private timeControlValue: TimeControl;
 
@@ -80,6 +94,8 @@ export class FourGame implements FourSession {
     this.role = options.role;
     this.roomId = options.roomId;
     this.format = options.format;
+    this.myPlayerId = options.playerId;
+    this.secret = options.secret;
     this.hostId = options.hostId ?? null;
     this.hostName = options.hostName ?? 'Anfitrion';
     this.timeControlValue = options.timeControl ?? { initial: 0, increment: 0 };
@@ -89,6 +105,9 @@ export class FourGame implements FourSession {
     this.socket.on('rtc:signal', this.onSignal);
     this.socket.on('rtc:hello', this.onHello);
     this.socket.on('room:peer-left', this.onPeerLeft);
+    this.socket.on('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.on('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.on('connect', this.onSocketConnect);
 
     if (this.role === 'guest' && this.hostId) {
       this.ensurePeer(this.hostId, false);
@@ -170,7 +189,7 @@ export class FourGame implements FourSession {
       seats[SEAT_ORDER[i]] = p.id;
     });
     this.seats = seats;
-    this.mySeatValue = this.seatForId(this.socket.id ?? '');
+    this.mySeatValue = this.seatForId(this.myPlayerId);
     this.started = true;
     this.phaseValue = 'playing';
     const msg: NetStart = { t: 'start', seats, timeControl: this.timeControlValue };
@@ -197,21 +216,32 @@ export class FourGame implements FourSession {
 
   private ensurePeer(peerId: string, initiator: boolean): void {
     if (this.peers.has(peerId)) return;
-    const peer = new PeerSession(
+    let peer!: PeerSession;
+    const current = () => this.peers.get(peerId) === peer;
+    peer = new PeerSession(
       initiator,
       {
         onOpen: () => {
+          if (!current()) return;
           this.openPeers.add(peerId);
+          if (this.role === 'host' && this.started) this.sendResync(peer);
           this.emit();
         },
-        onMessage: (msg: FourNetMsg) => this.handleNet(peerId, msg),
+        onMessage: (msg: FourNetMsg) => {
+          if (current()) this.handleNet(peerId, msg);
+        },
         onClose: () => {
+          if (!current()) return;
           this.openPeers.delete(peerId);
           this.emit();
         },
-        onStateChange: () => this.emit(),
+        onStateChange: () => {
+          if (current()) this.emit();
+        },
       },
-      (data) => this.socket.emit('rtc:signal', { to: peerId, data }),
+      (data) => {
+        if (current()) this.socket.emit('rtc:signal', { to: peerId, data });
+      },
     );
     this.peers.set(peerId, peer);
     const buffered = this.pendingSignals.get(peerId);
@@ -222,10 +252,30 @@ export class FourGame implements FourSession {
     if (initiator) void peer.createOffer();
   }
 
+  private resetPeer(peerId: string): void {
+    const peer = this.peers.get(peerId);
+    if (peer) peer.close();
+    this.peers.delete(peerId);
+    this.openPeers.delete(peerId);
+    this.pendingSignals.delete(peerId);
+  }
+
+  private resetAllPeers(): void {
+    for (const peer of this.peers.values()) peer.close();
+    this.peers.clear();
+    this.openPeers.clear();
+    this.pendingSignals.clear();
+  }
+
   private onSignal = (payload: { from: string; data: RtcSignal }): void => {
     const peer = this.peers.get(payload.from);
     if (peer) {
       void peer.handleSignal(payload.data);
+      return;
+    }
+    if (this.role === 'guest' && payload.from === this.hostId) {
+      this.ensurePeer(payload.from, false);
+      void this.peers.get(payload.from)?.handleSignal(payload.data);
       return;
     }
     const list = this.pendingSignals.get(payload.from) ?? [];
@@ -238,19 +288,70 @@ export class FourGame implements FourSession {
   };
 
   private onPeerLeft = (payload: { peerId: string }): void => {
-    const peer = this.peers.get(payload.peerId);
-    if (peer) peer.close();
-    this.peers.delete(payload.peerId);
-    this.openPeers.delete(payload.peerId);
-    this.pendingSignals.delete(payload.peerId);
+    this.resetPeer(payload.peerId);
     if (this.started) {
       const seat = this.seatForId(payload.peerId);
       if (seat && !this.engine.eliminated.has(seat) && !this.engine.result) {
         this.engine.resign(seat);
       }
     }
+    if (this.role === 'guest' && payload.peerId === this.hostId && this.phaseValue !== 'closed') {
+      this.error = 'El anfitrion abandono la sala';
+      this.phaseValue = 'closed';
+    }
     this.emit();
   };
+
+  private onPeerDisconnected = (payload: { peerId: string }): void => {
+    this.openPeers.delete(payload.peerId);
+    this.emit();
+  };
+
+  private onPeerReconnected = (payload: { peerId: string }): void => {
+    this.resetPeer(payload.peerId);
+    if (this.role === 'host') {
+      this.ensurePeer(payload.peerId, true);
+    } else if (payload.peerId === this.hostId) {
+      this.ensurePeer(payload.peerId, false);
+      this.socket.emit('rtc:hello', { to: payload.peerId });
+    }
+    this.emit();
+  };
+
+  private onSocketConnect = (): void => {
+    if (this.left || this.phaseValue === 'closed') return;
+    this.rejoin();
+  };
+
+  private rejoin(): void {
+    this.socket.emit(
+      'rooms:rejoin',
+      { roomId: this.roomId, playerId: this.myPlayerId, secret: this.secret },
+      (res: { ok: boolean; data?: { host: { id: string }; players: PlayerLite[] }; error?: string }) => {
+        if (!res.ok) {
+          this.error = res.error ?? 'No se pudo reconectar';
+          this.phaseValue = 'closed';
+          this.emit();
+          return;
+        }
+        if (res.data?.host) this.hostId = res.data.host.id;
+        if (res.data?.players) this.players = res.data.players;
+        this.resetAllPeers();
+        if (this.role === 'host') {
+          for (const p of this.players) {
+            if (p.id !== this.myPlayerId) this.ensurePeer(p.id, true);
+          }
+        } else if (this.hostId) {
+          this.ensurePeer(this.hostId, false);
+          this.socket.emit('rtc:hello', { to: this.hostId });
+        }
+        if (!this.started) this.phaseValue = this.players.length > 1 ? 'connecting' : 'waiting';
+        else this.phaseValue = 'connecting';
+        this.error = null;
+        this.emit();
+      },
+    );
+  }
 
   private seatForId(id: string): Seat | null {
     for (const seat of SEAT_ORDER) {
@@ -265,8 +366,13 @@ export class FourGame implements FourSession {
     for (const peer of this.peers.values()) peer.send(msg);
   }
 
+  private sendResync(peer: PeerSession): void {
+    const moves = this.engine.history.map((h) => h.move);
+    peer.send({ t: 'resync', seats: this.seats, moves, timeControl: this.timeControlValue } satisfies NetResync);
+  }
+
   private handleNet(fromPeerId: string, msg: FourNetMsg): void {
-    if (this.role === 'host') {
+    if (this.role === 'host' && msg.t !== 'resync') {
       for (const [id, peer] of this.peers) {
         if (id !== fromPeerId) peer.send(msg);
       }
@@ -279,7 +385,16 @@ export class FourGame implements FourSession {
       case 'start':
         this.seats = msg.seats;
         if (msg.timeControl) this.timeControlValue = msg.timeControl;
-        this.mySeatValue = this.seatForId(this.socket.id ?? '');
+        this.mySeatValue = this.seatForId(this.myPlayerId);
+        this.started = true;
+        this.phaseValue = 'playing';
+        break;
+      case 'resync':
+        this.seats = msg.seats;
+        if (msg.timeControl) this.timeControlValue = msg.timeControl;
+        this.engine.reset();
+        for (const move of msg.moves) this.engine.makeMove(move);
+        this.mySeatValue = this.seatForId(this.myPlayerId);
         this.started = true;
         this.phaseValue = 'playing';
         break;
@@ -330,13 +445,17 @@ export class FourGame implements FourSession {
   }
 
   leave(): void {
+    this.left = true;
+    clearSession(this.roomId);
     this.socket.emit('rooms:leave');
     this.socket.off('room:players', this.onPlayers);
     this.socket.off('rtc:signal', this.onSignal);
     this.socket.off('rtc:hello', this.onHello);
     this.socket.off('room:peer-left', this.onPeerLeft);
-    for (const peer of this.peers.values()) peer.close();
-    this.peers.clear();
+    this.socket.off('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.off('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.off('connect', this.onSocketConnect);
+    this.resetAllPeers();
     this.phaseValue = 'closed';
     this.emit();
   }

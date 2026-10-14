@@ -30,6 +30,8 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
 
   const engine = session.engine;
   const turn = snap.turn;
+  const displayOrder: Seat[] =
+    session.format === 'teams' ? ['red', 'yellow', 'blue', 'green'] : SEAT_ORDER;
 
   const clockTC =
     session.timeControl && (!session.online || (session.connected && session.phase === 'playing'))
@@ -225,7 +227,7 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
             </div>
           )}
 
-          {session.online && session.phase !== 'playing' && (
+          {session.online && (session.phase === 'waiting' || session.phase === 'connecting') && (
             <div className="result-overlay">
               <div className="result-card">
                 <h3>Esperando jugadores</h3>
@@ -233,10 +235,16 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
                   {session.playerCount}/{session.playerTarget} jugadores
                 </p>
                 <ul className="players players--wait">
-                  {SEAT_ORDER.map((seat) => (
+                  {displayOrder.map((seat) => (
                     <li key={seat}>
                       <span className="swatch" style={{ background: SEATS[seat].color }} />
                       {session.seatNames[seat] ?? '\u2014 vacio \u2014'}
+                      {session.format === 'teams' && (
+                        <span className="muted small">
+                          {' '}
+                          · {seat === 'red' || seat === 'yellow' ? 'Equipo A' : 'Equipo B'}
+                        </span>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -247,12 +255,26 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
                     onClick={() => session.start()}
                     disabled={!session.canStart}
                   >
-                    {session.canStart ? 'Empezar partida' : 'Faltan jugadores...'}
+                    {session.canStart
+                      ? 'Empezar partida'
+                      : `Faltan ${Math.max(0, session.playerTarget - session.playerCount)} jugador${session.playerTarget - session.playerCount === 1 ? '' : 'es'}...`}
                   </button>
                 ) : (
                   <p className="muted small">Esperando a que el anfitrion empiece...</p>
                 )}
                 {session.roomId && <RoomLink roomId={session.roomId} />}
+              </div>
+            </div>
+          )}
+
+          {session.online && session.phase === 'closed' && !snap.result && (
+            <div className="result-overlay">
+              <div className="result-card">
+                <h3>Desconectado</h3>
+                <p className="muted">{session.statusText}</p>
+                <button type="button" className="btn btn--ghost" onClick={handleLeave}>
+                  Salir
+                </button>
               </div>
             </div>
           )}
@@ -262,7 +284,7 @@ export function FourGameScreen({ session, onExit }: FourGameScreenProps) {
           <div className="panel">
             <div className="panel__title">Jugadores</div>
             <ul className="players">
-              {SEAT_ORDER.map((seat) => {
+              {displayOrder.map((seat) => {
                 const alive = !snap.eliminated.includes(seat);
                 const isTurn = seat === turn && !snap.result;
                 const isMe = session.mySeat === seat;

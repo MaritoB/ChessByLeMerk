@@ -5,6 +5,7 @@ import { VarChess } from '../var/engine';
 import type { VarConfig, VarSession } from '../var/session';
 import type { TimeControl } from '../game/clock';
 import { PeerSession } from './peer';
+import { clearSession } from './identity';
 
 interface VarStartMsg {
   t: 'start';
@@ -26,7 +27,13 @@ interface VarRematchMsg {
 interface VarAbortMsg {
   t: 'abort';
 }
-type VarNetMsg = VarStartMsg | VarActionMsg | VarResignMsg | VarRematchMsg | VarAbortMsg;
+interface VarResyncMsg {
+  t: 'resync';
+  actions: Action[];
+  config: VarConfig;
+  timeControl?: TimeControl;
+}
+type VarNetMsg = VarStartMsg | VarActionMsg | VarResignMsg | VarRematchMsg | VarAbortMsg | VarResyncMsg;
 
 export interface VarGameOptions {
   socket: Socket;
@@ -34,6 +41,8 @@ export interface VarGameOptions {
   roomId: string;
   config: VarConfig;
   playerName: string;
+  playerId: string;
+  secret: string;
   opponentId?: string;
   opponentName?: string;
   timeControl?: TimeControl;
@@ -48,11 +57,14 @@ export class VarGame implements VarSession {
   private readonly socket: Socket;
   private readonly role: 'host' | 'guest';
   readonly roomId: string;
+  private readonly myPlayerId: string;
+  private readonly secret: string;
   private remotePeerId: string | null;
   private opponentName: string;
   private peer: PeerSession | null = null;
   private pendingSignals: RtcSignal[] = [];
   private started = false;
+  private left = false;
   private myColorValue: Color | null = null;
   private listeners = new Set<() => void>();
   private timeControlValue: TimeControl;
@@ -62,6 +74,8 @@ export class VarGame implements VarSession {
     this.role = options.role;
     this.roomId = options.roomId;
     this.config = options.config;
+    this.myPlayerId = options.playerId;
+    this.secret = options.secret;
     this.remotePeerId = options.opponentId ?? null;
     this.opponentName = options.opponentName ?? 'Rival';
     this.timeControlValue = options.timeControl ?? { initial: 0, increment: 0 };
@@ -74,6 +88,9 @@ export class VarGame implements VarSession {
     this.socket.on('rtc:signal', this.onSignal);
     this.socket.on('rtc:hello', this.onHello);
     this.socket.on('room:peer-left', this.onPeerLeft);
+    this.socket.on('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.on('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.on('connect', this.onSocketConnect);
 
     if (options.role === 'guest' && options.opponentId) {
       this.createPeer(false);
@@ -118,41 +135,75 @@ export class VarGame implements VarSession {
 
   private createPeer(initiator: boolean): void {
     if (this.peer) return;
-    this.peer = new PeerSession(
+    let peer!: PeerSession;
+    peer = new PeerSession(
       initiator,
       {
-        onOpen: () => this.onOpen(),
-        onMessage: (msg: VarNetMsg) => this.onMessage(msg),
-        onClose: () => this.emit(),
-        onStateChange: () => this.emit(),
+        onOpen: () => {
+          if (this.peer === peer) this.onOpen();
+        },
+        onMessage: (msg: VarNetMsg) => {
+          if (this.peer === peer) this.onMessage(msg);
+        },
+        onClose: () => {
+          if (this.peer === peer) this.emit();
+        },
+        onStateChange: () => {
+          if (this.peer === peer) this.emit();
+        },
       },
       (data) => {
+        if (this.peer !== peer) return;
         if (this.remotePeerId) this.socket.emit('rtc:signal', { to: this.remotePeerId, data });
         else this.pendingSignals.push(data);
       },
     );
+    this.peer = peer;
     const buffered = this.pendingSignals;
     this.pendingSignals = [];
-    for (const s of buffered) void this.peer.handleSignal(s);
-    if (initiator) void this.peer.createOffer();
+    for (const s of buffered) void peer.handleSignal(s);
+    if (initiator) void peer.createOffer();
+  }
+
+  private closePeer(): void {
+    this.peer?.close();
+    this.peer = null;
+    this.pendingSignals = [];
   }
 
   private onOpen(): void {
-    if (this.role === 'host' && !this.started) {
-      const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
-      this.begin(white);
-      this.peer?.send({ t: 'start', white, config: this.config, timeControl: this.timeControlValue });
+    if (this.role === 'host') {
+      if (!this.started) {
+        const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
+        this.begin(white);
+        this.peer?.send({ t: 'start', white, config: this.config, timeControl: this.timeControlValue });
+      } else {
+        this.sendResync();
+      }
     }
     this.emit();
+  }
+
+  private sendResync(): void {
+    const actions = this.engine.snapshot().history.map((h) => h.action);
+    this.peer?.send({
+      t: 'resync',
+      actions,
+      config: this.config,
+      timeControl: this.timeControlValue,
+    } satisfies VarResyncMsg);
   }
 
   private onSignal = (payload: { from: string; data: RtcSignal }): void => {
     this.remotePeerId = payload.from;
     if (!this.peer) {
-      this.pendingSignals.push(payload.data);
-      return;
+      if (this.role === 'guest') this.createPeer(false);
+      else {
+        this.pendingSignals.push(payload.data);
+        return;
+      }
     }
-    void this.peer.handleSignal(payload.data);
+    void this.peer?.handleSignal(payload.data);
   };
 
   private onHello = (payload: { from: string }): void => {
@@ -168,6 +219,47 @@ export class VarGame implements VarSession {
     }
     this.emit();
   };
+
+  private onPeerDisconnected = (): void => {
+    if (this.started) this.emit();
+  };
+
+  private onPeerReconnected = (): void => {
+    this.resetAndReconnect();
+    this.emit();
+  };
+
+  private onSocketConnect = (): void => {
+    if (this.left) return;
+    this.rejoin();
+  };
+
+  private rejoin(): void {
+    this.socket.emit(
+      'rooms:rejoin',
+      { roomId: this.roomId, playerId: this.myPlayerId, secret: this.secret },
+      (res: { ok: boolean; data?: { host: { id: string }; players: { id: string }[] }; error?: string }) => {
+        if (!res.ok) return;
+        if (this.role === 'guest' && res.data?.host) this.remotePeerId = res.data.host.id;
+        else if (this.role === 'host' && res.data?.players) {
+          const other = res.data.players.find((p) => p.id !== this.myPlayerId);
+          if (other) this.remotePeerId = other.id;
+        }
+        this.resetAndReconnect();
+        this.emit();
+      },
+    );
+  }
+
+  private resetAndReconnect(): void {
+    this.closePeer();
+    if (this.role === 'host') {
+      this.createPeer(true);
+    } else {
+      this.createPeer(false);
+      if (this.remotePeerId) this.socket.emit('rtc:hello', { to: this.remotePeerId });
+    }
+  }
 
   private begin(white: 'host' | 'guest'): void {
     if (this.started) return;
@@ -193,6 +285,14 @@ export class VarGame implements VarSession {
         if (msg.timeControl) this.timeControlValue = msg.timeControl;
         if (msg.config) this.applyConfig(msg.config);
         this.begin(msg.white);
+        break;
+      case 'resync':
+        if (msg.timeControl) this.timeControlValue = msg.timeControl;
+        if (msg.config) this.applyConfig(msg.config);
+        this.engine.reset();
+        for (const action of msg.actions) this.engine.applyAction(action);
+        this.started = true;
+        this.emit();
         break;
       case 'action':
         this.engine.applyAction(msg.action);
@@ -238,11 +338,15 @@ export class VarGame implements VarSession {
   }
 
   leave(): void {
+    this.left = true;
+    clearSession(this.roomId);
     this.socket.emit('rooms:leave');
     this.socket.off('rtc:signal', this.onSignal);
     this.socket.off('rtc:hello', this.onHello);
     this.socket.off('room:peer-left', this.onPeerLeft);
-    this.peer?.close();
-    this.peer = null;
+    this.socket.off('room:peer-disconnected', this.onPeerDisconnected);
+    this.socket.off('room:peer-reconnected', this.onPeerReconnected);
+    this.socket.off('connect', this.onSocketConnect);
+    this.closePeer();
   }
 }
