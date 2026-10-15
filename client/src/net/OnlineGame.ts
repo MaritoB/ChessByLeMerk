@@ -104,6 +104,7 @@ export class OnlineGame {
     this.socket.on('rtc:signal', this.onRtcSignal);
     this.socket.on('rtc:hello', this.onRtcHello);
     this.socket.on('room:peer-joined', this.onPeerJoined);
+    this.socket.on('game:msg', this.onGameMsg);
     this.socket.on('room:peer-left', this.onPeerLeft);
     this.socket.on('room:peer-disconnected', this.onPeerDisconnected);
     this.socket.on('room:peer-reconnected', this.onPeerReconnected);
@@ -206,9 +207,33 @@ export class OnlineGame {
   };
 
   private onPeerJoined = (payload: { peer: { id: string; name: string } }): void => {
+    if (this.role !== 'host' || !payload?.peer?.id) return;
     this.remotePeerId = payload.peer.id;
     this.patch({ opponentName: payload.peer.name, phase: 'connecting' });
+    this.createPeer(true);
+    if (!this.started) {
+      const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
+      this.sendGame({ type: 'start', mode: this.mode.id, white, timeControl: this.timeControlValue });
+      this.beginGame(white);
+    } else {
+      this.sendResync();
+    }
   };
+
+  private onGameMsg = (payload: { from: string; data: Inbound }): void => {
+    if (!payload?.data) return;
+    if (payload.from) this.remotePeerId = payload.from;
+    this.onMessage(payload.data);
+  };
+
+  /** Envia por el canal P2P si esta abierto; si no, por el relay del servidor. */
+  private sendGame(msg: Inbound): void {
+    if (this.peer?.isOpen) {
+      this.peer.send(msg);
+      return;
+    }
+    if (this.remotePeerId) this.socket.emit('game:msg', { to: this.remotePeerId, data: msg });
+  }
 
   private onRtcHello = (payload: { from: string }): void => {
     this.remotePeerId = payload.from;
@@ -274,17 +299,10 @@ export class OnlineGame {
   };
 
   private onDataChannelOpen = (): void => {
-    if (this.role === 'host') {
-      if (!this.started) {
-        const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
-        const start: StartMsg = { type: 'start', mode: this.mode.id, white, timeControl: this.timeControlValue };
-        this.peer?.send(start);
-        this.beginGame(white);
-      } else {
-        this.sendResync();
-      }
-    }
-    this.patch({ connected: true, phase: this.started ? 'playing' : this.snapshotData.phase });
+    // La partida arranca por socket (room:peer-joined). Si el canal P2P abre con
+    // la partida en curso, mandamos un resync.
+    if (this.role === 'host' && this.started) this.sendResync();
+    if (this.started) this.patch({ connected: true, phase: 'playing', connectionState: 'connected' });
   };
 
   private sendResync(): void {
@@ -296,14 +314,14 @@ export class OnlineGame {
       lives: snap.lives,
       timeControl: this.timeControlValue,
     };
-    this.peer?.send(resync);
+    this.sendGame(resync);
   }
 
   private beginGame(whiteRole: 'host' | 'guest'): void {
     if (this.started) return;
     this.started = true;
     const myColor: Color = this.role === whiteRole ? 'w' : 'b';
-    this.patch({ phase: 'playing', myColor });
+    this.patch({ phase: 'playing', myColor, connected: this.socket.connected });
     this.pushChat('system', 'Partida iniciada. Juegas con las ' + (myColor === 'w' ? 'blancas' : 'negras'));
   }
 
@@ -348,7 +366,7 @@ export class OnlineGame {
     if (!color) return { ok: false, error: 'La partida no ha empezado' };
     const result = this.controller.attempt({ from, to, promotion }, color);
     if (result.ok && result.move) {
-      this.peer?.send({
+      this.sendGame({
         type: 'move',
         from: result.move.from,
         to: result.move.to,
@@ -365,7 +383,7 @@ export class OnlineGame {
     if (!color) return { ok: false, error: 'La partida no ha empezado' };
     const result = this.controller.mistake(color, reason);
     if (result.penalty) {
-      this.peer?.send({ type: 'mistake', by: color });
+      this.sendGame({ type: 'mistake', by: color });
     }
     return result;
   }
@@ -374,23 +392,23 @@ export class OnlineGame {
     const color = this.snapshotData.myColor;
     if (!color) return;
     this.controller.resign(color);
-    this.peer?.send({ type: 'resign', by: color });
+    this.sendGame({ type: 'resign', by: color });
   }
 
   abort(): void {
     this.controller.cancel();
-    this.peer?.send({ type: 'abort' });
+    this.sendGame({ type: 'abort' });
   }
 
   rematch(): void {
     this.controller.reset();
-    this.peer?.send({ type: 'rematch' });
+    this.sendGame({ type: 'rematch' });
   }
 
   sendChat(text: string): void {
     const clean = text.trim().slice(0, 200);
     if (!clean) return;
-    this.peer?.send({ type: 'chat', text: clean });
+    this.sendGame({ type: 'chat', text: clean });
     this.pushChat('me', clean);
   }
 
@@ -406,6 +424,7 @@ export class OnlineGame {
     this.socket.off('rtc:signal', this.onRtcSignal);
     this.socket.off('rtc:hello', this.onRtcHello);
     this.socket.off('room:peer-joined', this.onPeerJoined);
+    this.socket.off('game:msg', this.onGameMsg);
     this.socket.off('room:peer-left', this.onPeerLeft);
     this.socket.off('room:peer-disconnected', this.onPeerDisconnected);
     this.socket.off('room:peer-reconnected', this.onPeerReconnected);

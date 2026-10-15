@@ -210,6 +210,24 @@ io.on('connection', (socket) => {
     relayToPlayer(msg?.to, 'rtc:signal', { data: msg?.data });
   });
 
+  // Relay de mensajes de juego cuando el canal P2P (WebRTC) no esta disponible.
+  // El servidor solo reenvia; no interpreta las jugadas.
+  socket.on('game:msg', (msg: { to?: string; data: unknown }) => {
+    if (msg?.to) {
+      relayToPlayer(msg.to, 'game:msg', { data: msg.data });
+      return;
+    }
+    const roomId: string | undefined = socket.data.roomId;
+    const fromId: string | undefined = socket.data.playerId;
+    const room = roomId ? rooms.get(roomId) : undefined;
+    if (!room || !fromId) return;
+    for (const p of room.players.values()) {
+      if (p.id !== fromId && !p.disconnected) {
+        io.to(p.socketId).emit('game:msg', { from: fromId, data: msg.data });
+      }
+    }
+  });
+
   socket.on('rooms:rejoin', (payload: RejoinPayload, ack: (res: Ack<{ roomId: string; host: PeerInfo; mode: GameModeId; players: PeerInfo[] }>) => void) => {
     const id = (payload?.roomId || '').trim().toUpperCase();
     const room = rooms.get(id);

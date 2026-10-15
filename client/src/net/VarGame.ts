@@ -88,6 +88,8 @@ export class VarGame implements VarSession {
 
     this.socket.on('rtc:signal', this.onSignal);
     this.socket.on('rtc:hello', this.onHello);
+    this.socket.on('room:peer-joined', this.onPeerJoined);
+    this.socket.on('game:msg', this.onGameMsg);
     this.socket.on('room:peer-left', this.onPeerLeft);
     this.socket.on('room:peer-disconnected', this.onPeerDisconnected);
     this.socket.on('room:peer-reconnected', this.onPeerReconnected);
@@ -109,14 +111,12 @@ export class VarGame implements VarSession {
     return this.role === 'host' ? this.opponentName : 'Tu (negras)';
   }
   get connected(): boolean {
-    return this.started && Boolean(this.peer?.isOpen);
+    // Jugable desde que arranca la partida: usa P2P si esta abierto, si no el relay del servidor.
+    return this.started && this.socket.connected;
   }
   get statusText(): string {
-    if (this.myColorValue === null) {
-      return this.peer ? `Conectando P2P... (${this.connState})` : 'Esperando rival...';
-    }
-    if (!this.peer?.isOpen) return `Reconectando P2P... (${this.connState})`;
-    return `Sala ${this.roomId}`;
+    if (!this.started) return 'Esperando rival...';
+    return this.peer?.isOpen ? `Sala ${this.roomId}` : `Sala ${this.roomId} (relay)`;
   }
   get timeControl(): TimeControl {
     return this.timeControlValue;
@@ -178,21 +178,45 @@ export class VarGame implements VarSession {
   }
 
   private onOpen(): void {
-    if (this.role === 'host') {
-      if (!this.started) {
-        const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
-        this.begin(white);
-        this.peer?.send({ t: 'start', white, config: this.config, timeControl: this.timeControlValue });
-      } else {
-        this.sendResync();
-      }
-    }
+    // La partida arranca por socket (room:peer-joined). Si el canal P2P abre con
+    // la partida ya en curso, mandamos un resync (por si hubo jugadas por relay).
+    if (this.role === 'host' && this.started) this.sendResync();
     this.emit();
   }
 
+  /** Envia por el canal P2P si esta abierto; si no, por el relay del servidor. */
+  private sendGame(msg: VarNetMsg): void {
+    if (this.peer?.isOpen) {
+      this.peer.send(msg);
+      return;
+    }
+    if (this.remotePeerId) this.socket.emit('game:msg', { to: this.remotePeerId, data: msg });
+  }
+
+  private onPeerJoined = (payload: { peer: { id: string; name?: string } }): void => {
+    if (this.role !== 'host' || !payload?.peer?.id) return;
+    this.remotePeerId = payload.peer.id;
+    if (payload.peer.name) this.opponentName = payload.peer.name;
+    this.createPeer(true);
+    if (!this.started) {
+      const white: 'host' | 'guest' = Math.random() < 0.5 ? 'host' : 'guest';
+      this.begin(white);
+      this.sendGame({ t: 'start', white, config: this.config, timeControl: this.timeControlValue });
+    } else {
+      this.sendResync();
+    }
+    this.emit();
+  };
+
+  private onGameMsg = (payload: { from: string; data: VarNetMsg }): void => {
+    if (!payload?.data) return;
+    if (payload.from) this.remotePeerId = payload.from;
+    this.onMessage(payload.data);
+  };
+
   private sendResync(): void {
     const actions = this.engine.snapshot().history.map((h) => h.action);
-    this.peer?.send({
+    this.sendGame({
       t: 'resync',
       actions,
       config: this.config,
@@ -323,24 +347,24 @@ export class VarGame implements VarSession {
     if (!this.myColorValue) return false;
     if (this.engine.turn !== this.myColorValue) return false;
     const ok = this.engine.applyAction(action);
-    if (ok) this.peer?.send({ t: 'action', action });
+    if (ok) this.sendGame({ t: 'action', action });
     return ok;
   }
 
   resign(): void {
     if (!this.myColorValue) return;
     this.engine.resign(this.myColorValue);
-    this.peer?.send({ t: 'resign', color: this.myColorValue });
+    this.sendGame({ t: 'resign', color: this.myColorValue });
   }
 
   abort(): void {
     this.engine.cancel();
-    this.peer?.send({ t: 'abort' });
+    this.sendGame({ t: 'abort' });
   }
 
   rematch(): void {
     this.engine.reset();
-    this.peer?.send({ t: 'rematch' });
+    this.sendGame({ t: 'rematch' });
   }
 
   leave(): void {
@@ -349,6 +373,8 @@ export class VarGame implements VarSession {
     this.socket.emit('rooms:leave');
     this.socket.off('rtc:signal', this.onSignal);
     this.socket.off('rtc:hello', this.onHello);
+    this.socket.off('room:peer-joined', this.onPeerJoined);
+    this.socket.off('game:msg', this.onGameMsg);
     this.socket.off('room:peer-left', this.onPeerLeft);
     this.socket.off('room:peer-disconnected', this.onPeerDisconnected);
     this.socket.off('room:peer-reconnected', this.onPeerReconnected);
