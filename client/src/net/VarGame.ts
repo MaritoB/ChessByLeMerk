@@ -66,6 +66,7 @@ export class VarGame implements VarSession {
   private started = false;
   private left = false;
   private myColorValue: Color | null = null;
+  private connState: RTCPeerConnectionState = 'new';
   private listeners = new Set<() => void>();
   private timeControlValue: TimeControl;
 
@@ -111,7 +112,10 @@ export class VarGame implements VarSession {
     return this.started && Boolean(this.peer?.isOpen);
   }
   get statusText(): string {
-    if (this.myColorValue === null) return 'Esperando inicio...';
+    if (this.myColorValue === null) {
+      return this.peer ? `Conectando P2P... (${this.connState})` : 'Esperando rival...';
+    }
+    if (!this.peer?.isOpen) return `Reconectando P2P... (${this.connState})`;
     return `Sala ${this.roomId}`;
   }
   get timeControl(): TimeControl {
@@ -148,8 +152,10 @@ export class VarGame implements VarSession {
         onClose: () => {
           if (this.peer === peer) this.emit();
         },
-        onStateChange: () => {
-          if (this.peer === peer) this.emit();
+        onStateChange: (state) => {
+          if (this.peer !== peer) return;
+          if (state) this.connState = state;
+          this.emit();
         },
       },
       (data) => {

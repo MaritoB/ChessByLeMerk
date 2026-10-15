@@ -63,11 +63,8 @@ export class PeerSession {
 
     this.pc.onconnectionstatechange = () => {
       this.cb.onStateChange(this.pc.connectionState);
-      if (
-        this.pc.connectionState === 'failed' ||
-        this.pc.connectionState === 'disconnected' ||
-        this.pc.connectionState === 'closed'
-      ) {
+      // 'disconnected' suele ser transitorio (se recupera); solo 'failed'/'closed' son fatales.
+      if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
         this.cb.onClose();
       }
     };
@@ -147,6 +144,14 @@ export class PeerSession {
 
   get isOpen(): boolean {
     return this.dc?.readyState === 'open';
+  }
+
+  get connectionState(): RTCPeerConnectionState {
+    return this.pc.connectionState;
+  }
+
+  get iceState(): RTCIceConnectionState {
+    return this.pc.iceConnectionState;
   }
 
   close(): void {
